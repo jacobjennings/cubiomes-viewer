@@ -92,6 +92,7 @@ enum
     F_BIOME_SAMPLE,
     F_NOISE_SAMPLE,
     F_CHAMBERS,
+    F_BIOME_COUNT,
     // new filters should be added here at the end to keep some downwards compatibility
     FILTER_MAX,
 };
@@ -263,6 +264,15 @@ static const struct FilterList : private FilterInfo
             QT_TRANSLATE_NOOP("Filter",
             "Samples biomes in a given area to find if a proportion of the "
             "biomes match a set of allowed biomes.")
+        };
+
+        list[F_BIOME_COUNT] = FilterInfo{
+            CAT_BIOMES, 1, LOC_RAD, 0, 1, BR_NONE, MC_B1_7, MC_NEWEST, 0, 1, disp++,
+            "overworld",
+            QT_TRANSLATE_NOOP("Filter", "Total biomes count"),
+            QT_TRANSLATE_NOOP("Filter",
+            "Counts the number of unique biomes that exist around a certain point "
+            "like a structure. The count field specifies the minimum number of unique biomes required.")
         };
 
         list[F_BIOME] = FilterInfo{

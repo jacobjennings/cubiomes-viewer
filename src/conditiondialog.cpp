@@ -571,11 +571,22 @@ void ConditionDialog::updateMode()
 
     ui->buttonFromVisible->setEnabled(mapview && p2 && ui->comboRelative->currentIndex() == 0);
 
-    bool cnt = ft.branch == FilterInfo::BR_CLUST;
+    bool cnt = ft.branch == FilterInfo::BR_CLUST || filterindex == F_BIOME_COUNT;
 
     ui->labelSpinBox->setEnabled(cnt);
     ui->spinBox->setEnabled(cnt);
-    ui->checkSkipRef->setEnabled(cnt);
+    ui->checkSkipRef->setEnabled(ft.branch == FilterInfo::BR_CLUST);
+    
+    // Reset label text and settings to default if not F_BIOME_COUNT
+    if (filterindex != F_BIOME_COUNT)
+    {
+        if (ft.branch == FilterInfo::BR_CLUST)
+        {
+            ui->labelSpinBox->setText(tr("Instances within area:"));
+            // Reset minimum back to 0 for structure clusters
+            ui->spinBox->setMinimum(0);
+        }
+    }
 
     ui->labelY->setEnabled(ft.hasy);
     ui->comboY1->setEnabled(ft.hasy);
@@ -612,6 +623,20 @@ void ConditionDialog::updateMode()
         ui->checkMatchAny->setEnabled(true);
         if (filterindex == F_BIOME_SAMPLE)
             ui->stackedBiome->setCurrentWidget(ui->pageBiomeOptSample);
+        else if (filterindex == F_BIOME_COUNT)
+        {
+            ui->stackedBiome->setCurrentWidget(ui->pageBiomeOpt);
+            // Ensure spinBox is enabled for biome count filter
+            ui->labelSpinBox->setEnabled(true);
+            ui->spinBox->setEnabled(true);
+            // Update label text to be more descriptive for biome count
+            ui->labelSpinBox->setText(tr("Minimum biome count:"));
+            // Set minimum value to 1 (0 doesn't make sense for minimum count)
+            ui->spinBox->setMinimum(1);
+            // If current value is 0 or invalid, set to 1
+            if (ui->spinBox->value() == 0)
+                ui->spinBox->setValue(1);
+        }
         else
             ui->stackedBiome->setCurrentWidget(ui->pageBiomeOpt);
     }
@@ -959,6 +984,17 @@ bool ConditionDialog::warnIfBad(Condition cond)
                     "The set of allowed biomes is empty, which can never be satisfied. "
                     "Please include some biomes for the required proportion.");
                 warn(this, tr("No Allowed Biomes"), text);
+                return false;
+            }
+        }
+        else if (cond.type == F_BIOME_COUNT)
+        {
+            if (cond.count <= 0)
+            {
+                QString text = tr(
+                    "The biome count must be greater than zero. "
+                    "Please specify the minimum number of unique biomes required.");
+                warn(this, tr("Invalid Biome Count"), text);
                 return false;
             }
         }

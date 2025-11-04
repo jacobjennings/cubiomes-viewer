@@ -1848,6 +1848,89 @@ L_qm_any:
         }
         return COND_FAILED;
 
+    case F_BIOME_COUNT:
+        if (env->searchpass != PASS_FULL_64)
+            return COND_MAYBE_POS_INVAL;
+        if (cond->count <= 0)
+            return COND_FAILED;
+
+        s = 2; // use 1:4 scale for biome checking
+        rx1 = x1 >> s;
+        rz1 = z1 >> s;
+        rx2 = x2 >> s;
+        rz2 = z2 >> s;
+        {
+            int w = rx2 - rx1 + 1;
+            int h = rz2 - rz1 + 1;
+            Range r = {1<<s, rx1, rz1, w, h, s == 0 ? cond->y : cond->y >> 2, 1};
+            
+            env->init4Dim(DIM_OVERWORLD);
+            
+            int *ids = allocCache(&env->g, r);
+            if (!ids)
+                return COND_FAILED;
+            
+            if (genBiomes(&env->g, ids, r))
+            {
+                free(ids);
+                return COND_FAILED;
+            }
+            
+            // Count unique biomes using bitfields
+            uint64_t biomeBits = 0;
+            uint64_t biomeBitsM = 0;
+            int64_t rmaxsq_scaled = 0;
+            if (rmax > 0)
+            {
+                // Convert radius squared to scaled coordinates (scale 1:4 means each biome coord = 4 blocks)
+                rmaxsq_scaled = ((int64_t)rmax * rmax) >> (2 * s);
+            }
+            
+            for (int j = 0; j < h && !*env->stop; j++)
+            {
+                for (int i = 0; i < w && !*env->stop; i++)
+                {
+                    // Check radius if specified
+                    if (rmaxsq_scaled > 0)
+                    {
+                        int dx = (rx1 + i) - (at.x >> s);
+                        int dz = (rz1 + j) - (at.z >> s);
+                        int64_t rsq = (int64_t)dx * dx + (int64_t)dz * dz;
+                        if (rsq >= rmaxsq_scaled)
+                            continue;
+                    }
+                    
+                    int idx = j * w + i;
+                    int id = ids[idx];
+                    if (id < 0)
+                        continue;
+                    if (id < 128)
+                    {
+                        biomeBits |= (1ULL << id);
+                    }
+                    else
+                    {
+                        biomeBitsM |= (1ULL << (id - 128));
+                    }
+                }
+            }
+            
+            free(ids);
+            
+            if (*env->stop)
+                return COND_FAILED;
+            
+            // Count set bits in both bitfields
+            int uniqueCount = __builtin_popcountll(biomeBits) + __builtin_popcountll(biomeBitsM);
+            
+            cent->x = (x1 + x2) >> 1;
+            cent->z = (z1 + z2) >> 1;
+            if (imax) *imax = 1;
+            
+            return (uniqueCount >= cond->count) ? COND_OK : COND_FAILED;
+        }
+        return COND_FAILED;
+
 
     case F_BIOME_4_RIVER:
     case F_BIOME_256_OTEMP:
