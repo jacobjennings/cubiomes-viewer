@@ -14,16 +14,19 @@ namespace Ui {
 class TabBiomes;
 }
 
+class TabBiomes;
 class AnalysisBiomes : public QThread
 {
     Q_OBJECT
 public:
     explicit AnalysisBiomes(QObject *parent = nullptr)
-        : QThread(parent),idx() {}
+        : QThread(parent), tabbiomes(nullptr), idx(), centerCondEnv(nullptr), centerCond(nullptr) {}
 
     virtual void run() override;
     void runStatistics(Generator *g);
     void runLocate(Generator *g);
+    
+    TabBiomes *tabbiomes; // reference to parent TabBiomes for structure position lookup
 
 signals:
     void seedDone(uint64_t seed, QVector<uint64_t> cnt);
@@ -40,9 +43,17 @@ public:
         int scale;
         int locate;
         uint64_t samples;
+        int centerOnCondSave; // condition save index to center analysis on (0 = world origin)
     } dat;
     int minsize;
     int tolerance;
+    
+    // Conditions passed from GUI thread (for thread safety)
+    std::vector<Condition> centerConds;
+    
+    // Cached environment and condition for structure position lookup (when centering is enabled)
+    SearchThreadEnv *centerCondEnv;
+    const Condition *centerCond;
 };
 
 class BiomeTableModel : public QAbstractTableModel
@@ -130,6 +141,16 @@ public:
     virtual void refresh() override { refreshBiomes(); }
 
     void refreshBiomes(int activeid = -1);
+    
+    // Getter for parent MainWindow (needed by AnalysisBiomes thread)
+    MainWindow* getMainWindow() const { return parent; }
+    
+    // Getter/setter for center-on condition save index (for session save/load)
+    int getCenterOnConditionSave() const { return centerOnConditionSave; }
+    void setCenterOnConditionSave(int save) { centerOnConditionSave = save; }
+
+public slots:
+    void updateCenterOnFilterList();
 
 private slots:
     void onLocateHeaderClick();
@@ -147,6 +168,7 @@ private slots:
     void on_lineBiomeSize_textChanged(const QString &arg1);
     void on_treeLocate_itemClicked(QTreeWidgetItem *item, int column);
     void on_tabWidget_currentChanged(int index);
+    void on_comboCenterOn_currentIndexChanged(int index);
 
 private:
     void exportResults(QTextStream& stream);
@@ -166,6 +188,7 @@ private:
     uint64_t nextupdate;
     QVector<QVector<uint64_t>> qbufs;
     QList<QTreeWidgetItem*> qbufl;
+    int centerOnConditionSave; // selected condition save index (0 = world origin)
 };
 
 #endif // TABBIOMES_H

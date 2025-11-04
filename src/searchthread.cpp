@@ -29,6 +29,8 @@ void Session::writeHeader(QTextStream& stream)
 
     for (Condition &c : cv)
         stream << "#Cond: " << c.toHex() << "\n";
+    if (centerOnBiomesConditionSave != 0)
+        stream << "#CenterOnBiomes: " << centerOnBiomesConditionSave << "\n";
     stream.flush();
 }
 
@@ -100,6 +102,10 @@ bool Session::load(QWidget *widget, QTextStream& stream, bool quiet)
                 if (button != QMessageBox::Yes)
                     return false;
             }
+        }
+        else if (sscanf(line.toLocal8Bit().data(), "#CenterOnBiomes: %d", &centerOnBiomesConditionSave) == 1)
+        {
+            continue;
         }
         else
         {   // Seeds

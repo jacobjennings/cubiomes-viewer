@@ -6,6 +6,7 @@
 #include "rangedialog.h"
 #include "search.h"
 #include "util.h"
+#include "cubiomes/finders.h"
 
 #include <QAction>
 #include <QClipboard>
@@ -116,8 +117,20 @@ FormSearchControl::FormSearchControl(MainWindow *parent)
     , qbuf()
     , nextupdate()
     , updt(20)
+    , centerOnConditionSave(0)
 {
     ui->setupUi(this);
+    
+    // Add "None" option to center on dropdown
+    ui->comboCenterOn->addItem(tr("None"), 0);
+    
+    // Connect dropdown change signal
+    connect(ui->comboCenterOn, SIGNAL(currentIndexChanged(int)),
+            this, SLOT(on_comboCenterOn_currentIndexChanged(int)));
+    
+    // Connect conditions changed signal to update dropdown
+    connect(parent->formCond, &FormConditions::changed,
+            this, &FormSearchControl::updateCenterOnFilterList);
 
     ui->comboSearchType->addItem(tr("incremental"), SEARCH_INC);
     ui->comboSearchType->addItem(tr("48-bit only"), SEARCH_48ONLY);
@@ -150,6 +163,9 @@ FormSearchControl::FormSearchControl(MainWindow *parent)
     ui->spinThreads->setValue(QThread::idealThreadCount());
 
     searchLockUi(false);
+    
+    // Populate initial center-on filter list
+    updateCenterOnFilterList();
 }
 
 FormSearchControl::~FormSearchControl()
@@ -192,6 +208,7 @@ SearchConfig FormSearchControl::getSearchConfig()
     s.stoponres = ui->checkStop->isChecked();
     s.smin = smin;
     s.smax = smax;
+    s.centerOnConditionSave = centerOnConditionSave;
     return s;
 }
 
@@ -212,6 +229,7 @@ bool FormSearchControl::setSearchConfig(SearchConfig s, bool quiet)
     ui->checkStop->setChecked(s.stoponres);
     smin = s.smin;
     smax = s.smax;
+    centerOnConditionSave = s.centerOnConditionSave;
 
 #if WASM
     (void) quiet;
@@ -221,6 +239,9 @@ bool FormSearchControl::setSearchConfig(SearchConfig s, bool quiet)
 #endif
 
     ui->lineStart->setText(QString::asprintf("%" PRId64, (int64_t)s.startseed));
+
+    // Restore center-on selection after updating the filter list
+    updateCenterOnFilterList();
 
     return ok;
 }
@@ -457,7 +478,19 @@ void FormSearchControl::onSeedSelectionChanged()
 {
     uint64_t s;
     if (getSeed(ui->results->currentIndex().row(), &s))
+    {
         emit selectedSeedChanged(s);
+        
+        // If a center-on filter is selected, center the map on that structure
+        if (centerOnConditionSave > 0)
+        {
+            Pos pos;
+            if (getStructurePosition(s, centerOnConditionSave, &pos))
+            {
+                parent->getMapView()->setView(pos.x + 0.5, pos.z + 0.5);
+            }
+        }
+    }
 }
 
 void FormSearchControl::on_results_clicked(const QModelIndex &)
@@ -852,4 +885,107 @@ void FormSearchControl::keyReleaseEvent(QKeyEvent *event)
             pasteResults();
     }
     QWidget::keyReleaseEvent(event);
+}
+
+void FormSearchControl::on_comboCenterOn_currentIndexChanged(int index)
+{
+    centerOnConditionSave = ui->comboCenterOn->itemData(index).toInt();
+}
+
+void FormSearchControl::updateCenterOnFilterList()
+{
+    // Save current selection
+    int currentSave = centerOnConditionSave;
+    
+    // Clear and add "None" option
+    ui->comboCenterOn->clear();
+    ui->comboCenterOn->addItem(tr("None"), 0);
+    
+    // Get current conditions
+    const std::vector<Condition>& conds = parent->formCond->getConditions();
+    
+    // Add structure filters to dropdown
+    for (const Condition& c : conds)
+    {
+        if (c.meta & Condition::DISABLED)
+            continue;
+            
+        const FilterInfo& ft = g_filterinfo.list[c.type];
+        
+        // Only add structure filters (those with stype > 0) and quad structures
+        if (ft.stype > 0 || c.type == F_QH_IDEAL || c.type == F_QH_CLASSIC || 
+            c.type == F_QH_NORMAL || c.type == F_QH_BARELY || 
+            c.type == F_QM_90 || c.type == F_QM_95)
+        {
+            QString summary = c.summary(false);
+            ui->comboCenterOn->addItem(summary, c.save);
+        }
+    }
+    
+    // Restore selection if still valid
+    int idx = ui->comboCenterOn->findData(currentSave);
+    if (idx >= 0)
+        ui->comboCenterOn->setCurrentIndex(idx);
+    else
+        centerOnConditionSave = 0;
+}
+
+bool FormSearchControl::getStructurePosition(uint64_t seed, int condSave, Pos *pos)
+{
+    if (condSave <= 0 || pos == nullptr)
+        return false;
+    
+    // Get conditions
+    std::vector<Condition> conds = parent->formCond->getConditions();
+    
+    // Find the condition with matching save index
+    const Condition* targetCond = nullptr;
+    for (const Condition& c : conds)
+    {
+        if (c.save == condSave && !(c.meta & Condition::DISABLED))
+        {
+            targetCond = &c;
+            break;
+        }
+    }
+    
+    if (!targetCond)
+        return false;
+    
+    // Get world info to set up environment
+    WorldInfo wi;
+    parent->getSeed(&wi, false);
+    wi.seed = seed;
+    
+    // Create condition tree with all conditions (needed for relative references)
+    ConditionTree tree;
+    QString err = tree.set(conds, wi.mc);
+    if (!err.isEmpty())
+        return false;
+    
+    // Set up search environment
+    SearchThreadEnv env;
+    err = env.init(wi.mc, wi.large, tree);
+    if (!err.isEmpty())
+        return false;
+    
+    env.setSeed(seed);
+    std::atomic_bool stop(false);
+    env.stop = &stop;
+    
+    // Allocate path buffer (one entry per condition save index)
+    Pos path[100];
+    memset(path, -1, sizeof(path));
+    
+    // Test at origin to get structure position
+    Pos origin = {0, 0};
+    int result = testTreeAt(origin, &env, PASS_FULL_64, path);
+    
+    if (result == COND_OK && path[targetCond->save].x != -1 && path[targetCond->save].z != -1)
+    {
+        *pos = path[targetCond->save];
+        return true;
+    }
+    
+    return false;
 }

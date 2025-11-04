@@ -234,6 +234,7 @@ struct SearchConfig
     bool stoponres;
     uint64_t smin;
     uint64_t smax;
+    int centerOnConditionSave;
 
     SearchConfig() { reset(); }
 

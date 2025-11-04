@@ -3,6 +3,9 @@
 
 #include "message.h"
 #include "util.h"
+#include "search.h"
+#include "formsearchcontrol.h"
+#include "formconditions.h"
 
 #include <QDebug>
 #include <QFileDialog>
@@ -19,6 +22,61 @@ void AnalysisBiomes::run()
 
     Generator g;
     setupGenerator(&g, wi.mc, wi.large);
+    
+    // Initialize condition environment if centering is enabled
+    centerCondEnv = nullptr;
+    centerCond = nullptr;
+    if (dat.centerOnCondSave > 0 && !centerConds.empty())
+    {
+        // Check if target condition exists (conditions were passed from GUI thread)
+        bool found = false;
+        for (const Condition& c : centerConds)
+        {
+            if (c.save == dat.centerOnCondSave && !(c.meta & Condition::DISABLED))
+            {
+                found = true;
+                break;
+            }
+        }
+        
+        if (found)
+        {
+            // Create condition tree (needed for relative references)
+            ConditionTree tree;
+            QString err = tree.set(centerConds, wi.mc);
+            if (err.isEmpty())
+            {
+                // Initialize search environment once (expensive operation)
+                centerCondEnv = new SearchThreadEnv();
+                err = centerCondEnv->init(wi.mc, wi.large, tree);
+                if (err.isEmpty())
+                {
+                    // Find the condition in the tree's condvec (conditions are indexed by save)
+                    // Note: condvec uses save as index, but we need to search to be safe
+                    for (size_t i = 0; i < centerCondEnv->condtree.condvec.size(); i++)
+                    {
+                        const Condition& c = centerCondEnv->condtree.condvec[i];
+                        if (c.save == dat.centerOnCondSave && !(c.meta & Condition::DISABLED))
+                        {
+                            centerCond = &c;
+                            break;
+                        }
+                    }
+                    if (!centerCond)
+                    {
+                        // Condition not found in tree, clean up
+                        delete centerCondEnv;
+                        centerCondEnv = nullptr;
+                    }
+                }
+                else
+                {
+                    delete centerCondEnv;
+                    centerCondEnv = nullptr;
+                }
+            }
+        }
+    }
 
     for (idx = 0; idx < (long)seeds.size(); idx++)
     {
@@ -29,11 +87,56 @@ void AnalysisBiomes::run()
         else
             runStatistics(&g);
     }
+    
+    // Clean up cached environment
+    if (centerCondEnv)
+    {
+        delete centerCondEnv;
+        centerCondEnv = nullptr;
+    }
 }
 
 void AnalysisBiomes::runStatistics(Generator *g)
 {
     QVector<uint64_t> idcnt(257);
+    
+    // Get structure position offset if center-on condition is selected
+    int offsetX = 0, offsetZ = 0;
+    if (dat.centerOnCondSave > 0 && centerCondEnv && centerCond)
+    {
+        // Set the seed in the cached environment (reuse the expensive setup)
+        centerCondEnv->setSeed(wi.seed);
+        centerCondEnv->stop = &stop; // Use the thread's stop flag
+        
+        // Test condition tree at origin to get structure position
+        // Use path buffer to get position for the specific condition (needed for relative references)
+        Pos path[100];
+        memset(path, -1, sizeof(path));
+        Pos origin = {0, 0};
+        int result = testTreeAt(origin, centerCondEnv, PASS_FULL_64, path);
+        
+        if (result == COND_OK && path[centerCond->save].x != -1 && path[centerCond->save].z != -1)
+        {
+            Pos structPos = path[centerCond->save];
+            // Convert structure position from block coordinates to scaled coordinates
+            // Calculate shift amount based on scale (scale = 1 << shift)
+            int shift = 0;
+            if (dat.scale == 4) shift = 2;
+            else if (dat.scale == 16) shift = 4;
+            else if (dat.scale == 64) shift = 6;
+            else if (dat.scale == 256) shift = 8;
+            // else shift = 0 for scale 1
+            
+            offsetX = structPos.x >> shift;
+            offsetZ = structPos.z >> shift;
+        }
+        else
+        {
+            // If structure position can't be found, skip this seed
+            return;
+        }
+    }
+    
     int w = dat.x2 - dat.x1 + 1;
     int h = dat.z2 - dat.z1 + 1;
     uint64_t n = w * (uint64_t)h;
@@ -53,7 +156,8 @@ void AnalysisBiomes::runStatistics(Generator *g)
                 {
                     int w = dat.x2-x+1 < step ? dat.x2-x+1 : step;
                     int h = dat.z2-z+1 < step ? dat.z2-z+1 : step;
-                    Range r = {dat.scale, x, z, w, h, wi.y, 1};
+                    // Apply offset to analysis coordinates
+                    Range r = {dat.scale, x + offsetX, z + offsetZ, w, h, wi.y, 1};
                     int *ids = allocCache(g, r);
                     genBiomes(g, ids, r);
                     for (int i = 0; i < w*h; i++)
@@ -103,7 +207,8 @@ void AnalysisBiomes::runStatistics(Generator *g)
                 uint64_t idx = order[i];
                 int x = (int) (idx % w);
                 int z = (int) (idx / w);
-                int id = getBiomeAt(g, dat.scale, dat.x1+x, wi.y, dat.z1+z);
+                // Apply offset to analysis coordinates
+                int id = getBiomeAt(g, dat.scale, dat.x1+x+offsetX, wi.y, dat.z1+z+offsetZ);
                 idcnt[ id & 0xff ]++;
             }
         }
@@ -350,8 +455,11 @@ TabBiomes::TabBiomes(MainWindow *parent)
     , elapsed()
     , updt(20)
     , nextupdate()
+    , centerOnConditionSave(0)
 {
     ui->setupUi(this);
+    
+    thread.tabbiomes = this;
 
     proxy->setSourceModel(model);
     ui->table->setModel(proxy);
@@ -395,6 +503,15 @@ TabBiomes::TabBiomes(MainWindow *parent)
         QRegularExpression("(" + bnames.join("|") + ")"), this
     );
     ui->comboBiome->lineEdit()->setValidator(reval);
+    
+    // Initialize center-on combo box
+    ui->comboCenterOn->addItem(tr("None"), 0);
+    connect(ui->comboCenterOn, SIGNAL(currentIndexChanged(int)),
+            this, SLOT(on_comboCenterOn_currentIndexChanged(int)));
+    updateCenterOnFilterList();
+    
+    // Connect to condition changes to update the combo box
+    connect(parent->formCond, &FormConditions::changed, this, &TabBiomes::updateCenterOnFilterList);
 }
 
 TabBiomes::~TabBiomes()
@@ -433,6 +550,7 @@ void TabBiomes::save(QSettings& settings)
     settings.setValue("analysis/biomeid", str2biome[ui->comboBiome->currentText()]);
     settings.setValue("analysis/biomesize", ui->lineBiomeSize->text().toInt());
     settings.setValue("analysis/tolerance", ui->lineTolerance->text().toInt());
+    settings.setValue("analysis/centerOnCondSave", centerOnConditionSave);
 }
 
 static void loadCheck(QSettings *s, QCheckBox *cb, const char *key)
@@ -467,6 +585,8 @@ void TabBiomes::load(QSettings& settings)
     refreshBiomes(settings.value("analysis/biomeid", -1).toInt());
     loadLine(&settings, ui->lineBiomeSize, "analysis/biomesize");
     loadLine(&settings, ui->lineTolerance, "analysis/tolerance");
+    centerOnConditionSave = settings.value("analysis/centerOnCondSave", 0).toInt();
+    updateCenterOnFilterList(); // This will restore the selection
 }
 
 void TabBiomes::refreshBiomes(int activeid)
@@ -532,6 +652,16 @@ void TabBiomes::onVHeaderClicked(int row)
         parent->getSeed(&wi);
         wi.seed = seed;
         parent->setSeed(wi);
+        
+        // If a center-on filter is selected, center the map on that structure
+        if (centerOnConditionSave > 0)
+        {
+            Pos pos;
+            if (parent->formControl->getStructurePosition(seed, centerOnConditionSave, &pos))
+            {
+                parent->getMapView()->setView(pos.x + 0.5, pos.z + 0.5);
+            }
+        }
     }
 }
 
@@ -725,6 +855,17 @@ void TabBiomes::on_pushStart_clicked()
     thread.dat.z1 = z1 >> s;
     thread.dat.x2 = x2 >> s;
     thread.dat.z2 = z2 >> s;
+    thread.dat.centerOnCondSave = centerOnConditionSave;
+    
+    // Get conditions from GUI thread before starting worker thread (thread safety)
+    if (centerOnConditionSave > 0)
+    {
+        thread.centerConds = parent->formCond->getConditions();
+    }
+    else
+    {
+        thread.centerConds.clear();
+    }
 
     if (thread.dat.locate < 0)
         dats = thread.dat;
@@ -905,5 +1046,48 @@ void TabBiomes::on_tabWidget_currentChanged(int)
             ok = ui->treeLocate->topLevelItemCount() > 0;
     }
     ui->pushExport->setEnabled(ok);
+}
+
+void TabBiomes::on_comboCenterOn_currentIndexChanged(int index)
+{
+    centerOnConditionSave = ui->comboCenterOn->itemData(index).toInt();
+}
+
+void TabBiomes::updateCenterOnFilterList()
+{
+    // Save current selection
+    int currentSave = centerOnConditionSave;
+    
+    // Clear and add "None" option
+    ui->comboCenterOn->clear();
+    ui->comboCenterOn->addItem(tr("None"), 0);
+    
+    // Get current conditions
+    const std::vector<Condition>& conds = parent->formCond->getConditions();
+    
+    // Add structure filters to dropdown
+    for (const Condition& c : conds)
+    {
+        if (c.meta & Condition::DISABLED)
+            continue;
+            
+        const FilterInfo& ft = g_filterinfo.list[c.type];
+        
+        // Only add structure filters (those with stype > 0) and quad structures
+        if (ft.stype > 0 || c.type == F_QH_IDEAL || c.type == F_QH_CLASSIC || 
+            c.type == F_QH_NORMAL || c.type == F_QH_BARELY || 
+            c.type == F_QM_90 || c.type == F_QM_95)
+        {
+            QString summary = c.summary(false);
+            ui->comboCenterOn->addItem(summary, c.save);
+        }
+    }
+    
+    // Restore selection if still valid
+    int idx = ui->comboCenterOn->findData(currentSave);
+    if (idx >= 0)
+        ui->comboCenterOn->setCurrentIndex(idx);
+    else
+        centerOnConditionSave = 0;
 }
 

@@ -24,6 +24,7 @@ struct Session
     Gen48Config gen48;
     std::vector<Condition> cv;
     std::vector<uint64_t> slist;
+    int centerOnBiomesConditionSave;
 };
 
 struct SearchWorker;

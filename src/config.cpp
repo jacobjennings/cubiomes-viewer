@@ -523,6 +523,7 @@ void SearchConfig::reset()
     stoponres = true;
     smin = 0;
     smax = ~(uint64_t)0;
+    centerOnConditionSave = 0;
 }
 
 bool SearchConfig::read(const QString& line)
@@ -537,6 +538,7 @@ bool SearchConfig::read(const QString& line)
     if (sscanf(p, "#ResStop:  %d", &tmp) == 1)              { stoponres = tmp; return true; }
     if (sscanf(p, "#SMin:     %" PRIu64, &smin) == 1)       return true;
     if (sscanf(p, "#SMax:     %" PRIu64, &smax) == 1)       return true;
+    if (sscanf(p, "#CenterOn: %d", &centerOnConditionSave) == 1) return true;
     return false;
 }
 
@@ -552,6 +554,8 @@ void SearchConfig::write(QTextStream& stream)
         stream << "#SMin:     " << smin << "\n";
     if (smax != ~(uint64_t)0)
         stream << "#SMax:     " << smax << "\n";
+    if (centerOnConditionSave != 0)
+        stream << "#CenterOn: " << centerOnConditionSave << "\n";
     stream.flush();
 }
 

@@ -599,6 +599,22 @@ bool MainWindow::saveSession(QTextStream& stream)
     session.cv = formCond->getConditions();
     session.slist = formControl->getResults();
     getSeed(&session.wi);
+    
+    // Get TabBiomes center-on selection
+    TabBiomes *tabBiomes = nullptr;
+    for (int i = 0; i < ui->tabContainer->count(); i++)
+    {
+        if (TabBiomes *tb = dynamic_cast<TabBiomes*>(ui->tabContainer->widget(i)))
+        {
+            tabBiomes = tb;
+            break;
+        }
+    }
+    if (tabBiomes)
+        session.centerOnBiomesConditionSave = tabBiomes->getCenterOnConditionSave();
+    else
+        session.centerOnBiomesConditionSave = 0;
+    
     return session.save(this, stream);
 }
 
@@ -609,6 +625,7 @@ bool MainWindow::loadSession(QTextStream& stream, bool keepresults, bool quiet)
     getSeed(&session.wi);
     session.sc = formControl->getSearchConfig();
     session.gen48 = formGen48->getConfig(false);
+    session.centerOnBiomesConditionSave = 0; // Initialize, will be loaded from file if present
 
     if (!session.load(this, stream, quiet))
         return false;
@@ -630,6 +647,22 @@ bool MainWindow::loadSession(QTextStream& stream, bool keepresults, bool quiet)
     formControl->setSearchConfig(session.sc, quiet);
     formControl->searchResultsAdd(session.slist, false);
     formControl->searchProgressReset();
+
+    // Restore TabBiomes center-on selection
+    TabBiomes *tabBiomes = nullptr;
+    for (int i = 0; i < ui->tabContainer->count(); i++)
+    {
+        if (TabBiomes *tb = dynamic_cast<TabBiomes*>(ui->tabContainer->widget(i)))
+        {
+            tabBiomes = tb;
+            break;
+        }
+    }
+    if (tabBiomes)
+    {
+        tabBiomes->setCenterOnConditionSave(session.centerOnBiomesConditionSave);
+        tabBiomes->updateCenterOnFilterList();
+    }
 
     return true;
 }

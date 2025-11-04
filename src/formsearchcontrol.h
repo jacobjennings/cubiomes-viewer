@@ -115,6 +115,9 @@ public:
     void setSearchMode(int mode);
 
     bool getSeed(int row, uint64_t *seed);
+    
+    // Get structure position for a seed and condition index
+    bool getStructurePosition(uint64_t seed, int condSave, Pos *pos);
 
 signals:
     void selectedSeedChanged(uint64_t seed);
@@ -136,6 +139,8 @@ public slots:
     void on_buttonSearchHelp_clicked();
 
     void on_comboSearchType_currentIndexChanged(int index);
+    void on_comboCenterOn_currentIndexChanged(int index);
+    void updateCenterOnFilterList();
 
     void pasteResults();
     int pasteList(bool dummy);
@@ -175,6 +180,9 @@ private:
     std::vector<uint64_t> qbuf;
     quint64 nextupdate;
     quint64 updt;
+    
+    // selected condition save index for centering (0 = none)
+    int centerOnConditionSave;
 };
 
 #endif // FORMSEARCHCONTROL_H
