@@ -98,7 +98,7 @@ void AnalysisBiomes::run()
 
 void AnalysisBiomes::runStatistics(Generator *g)
 {
-    QVector<uint64_t> idcnt(257);
+    QVector<uint64_t> idcnt(258);
     
     // Get structure position offset if center-on condition is selected
     int offsetX = 0, offsetZ = 0;
@@ -215,9 +215,23 @@ void AnalysisBiomes::runStatistics(Generator *g)
     }
 
     int bcnt = 0;
-    for (uint64_t c : qAsConst(idcnt))
-        bcnt += !!c;
+    uint64_t totalcnt = 0;
+    uint64_t watercnt = 0;
+    for (int i = 0; i < 256; i++)
+    {
+        uint64_t c = idcnt[i];
+        if (c > 0)
+        {
+            bcnt++;
+            totalcnt += c;
+            // Check if this biome is oceanic or river (water biomes)
+            if (isOceanic(i) || i == river || i == frozen_river)
+                watercnt += c;
+        }
+    }
     idcnt[256] = bcnt;
+    // Store water percentage (multiplied by 10000 to avoid floating point, gives 2 decimal precision)
+    idcnt[257] = totalcnt > 0 ? (watercnt * 10000) / totalcnt : 0;
 
     if (!stop) // discard partially processed seed
         emit seedDone(wi.seed, idcnt);
@@ -298,7 +312,13 @@ QVariant BiomeTableModel::headerData(int section, Qt::Orientation orientation, i
         if (role == Qt::UserRole+1)
             return bname ? bname : "#"; // export role
         if (role == Qt::DisplayRole)
-            return id == 256 ? tr("Biomes") : getBiomeDisplay(cmp.mc, id);
+        {
+            if (id == 256)
+                return tr("Biomes");
+            if (id == 257)
+                return tr("Water %");
+            return getBiomeDisplay(cmp.mc, id);
+        }
         if (role == Qt::ToolTipRole && bname)
             return QVariant::fromValue(QString("%1:%2").arg(id).arg(bname));
     }
