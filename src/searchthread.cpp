@@ -4,6 +4,8 @@
 #include "formsearchcontrol.h"
 #include "message.h"
 #include "seedtables.h"
+#include "searchcoordinator.h"
+#include "searchworkerclient.h"
 
 #include "cubiomes/quadbase.h"
 #include "cubiomes/util.h"
@@ -156,6 +158,10 @@ SearchMaster::SearchMaster(QWidget *parent)
     , smin()
     , smax()
     , isdone()
+    , coordinator(nullptr)
+    , workerHosts()
+    , workerPort(23473)
+    , localWorkerClient(nullptr)
 {
     env.stop = &stop;
 }
@@ -163,6 +169,50 @@ SearchMaster::SearchMaster(QWidget *parent)
 SearchMaster::~SearchMaster()
 {
     stopSearch();
+    clearWorkers();
+}
+
+void SearchMaster::setWorkers(const QStringList& workerHosts, quint16 port)
+{
+    this->workerHosts = workerHosts;
+    this->workerPort = port;
+    
+    // Connect to worker servers (workers listen, coordinator connects)
+    if (!coordinator)
+    {
+        coordinator = new SearchCoordinator(this);
+        // Use the overload with (uint64_t, QString) signature
+        connect(coordinator, &SearchCoordinator::searchResult, 
+                this, static_cast<void (SearchMaster::*)(uint64_t, const QString&)>(&SearchMaster::onWorkerResult));
+        connect(coordinator, &SearchCoordinator::searchFinish, this, &SearchMaster::searchFinish);
+    }
+    
+    if (!workerHosts.isEmpty())
+    {
+        coordinator->connectToWorkers(workerHosts, port);
+        qDebug() << "Coordinator connecting to" << workerHosts.size() << "workers on port" << port;
+    }
+    else
+    {
+        coordinator->disconnectFromWorkers();
+    }
+}
+
+void SearchMaster::clearWorkers()
+{
+    if (coordinator)
+    {
+        coordinator->disconnectFromWorkers();
+        coordinator->deleteLater();
+        coordinator = nullptr;
+    }
+    if (localWorkerClient)
+    {
+        localWorkerClient->stop();
+        localWorkerClient->deleteLater();
+        localWorkerClient = nullptr;
+    }
+    workerHosts.clear();
 }
 
 bool SearchMaster::set(QWidget *widget, const Session& s)
@@ -366,6 +416,10 @@ static void genQHBases(int qual, uint64_t salt, std::vector<uint64_t>& list48)
 static bool applyTranspose(std::vector<uint64_t>& slist,
         const Gen48Config& gen48, uint64_t bufmax)
 {
+    // Build expanded candidates in the SAME order as worker local generator:
+    // base-major (QH/QM base order) and within each base, grid scan row-major.
+    // Do NOT sort/unique here to preserve a consistent global index across
+    // coordinator and workers without sending the full list over the wire.
     std::vector<uint64_t> list48;
 
     int x = gen48.x1;
@@ -387,15 +441,14 @@ static bool applyTranspose(std::vector<uint64_t>& slist,
         return false;
     }
 
+    // Preserve original base order and expand in grid order
+    std::vector<uint64_t> bases = slist;
     uint64_t *p = list48.data();
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            for (uint64_t b : slist)
+    for (uint64_t b : bases)
+        for (int j = 0; j < h; j++)
+            for (int i = 0; i < w; i++)
                 *p++ = moveStructure(b, x+i, z+j);
 
-    std::sort(list48.begin(), list48.end());
-    auto last = std::unique(list48.begin(), list48.end());
-    list48.erase(last, list48.end());
     slist.swap(list48);
     return !slist.empty();
 }
@@ -456,7 +509,20 @@ void SearchMaster::preSearch()
         }
 
         if (!slist.empty())
+        {
             applyTranspose(slist, gen48, PRECOMPUTE48_BUFSIZ);
+            // Debug: log first few 48-bit candidates after transpose (once)
+            static bool logged = false;
+            if (!logged)
+            {
+                int n = std::min<int>(8, (int)slist.size());
+                QStringList vals;
+                for (int i = 0; i < n; i++)
+                    vals << QString::asprintf("%012llx", (unsigned long long)slist[i]);
+                qDebug() << "Coordinator local slist[0.." << n-1 << "]=" << vals.join(", ");
+                logged = true;
+            }
+        }
     }
 
     if (searchtype == SEARCH_LIST)
@@ -586,12 +652,34 @@ void SearchMaster::startSearch()
         return;
     }
 
+    // If using distributed workers, set up coordinator
+    if (coordinator)
+    {
+        Session s;
+        s.wi.mc = mc;
+        s.wi.large = large;
+        s.sc.searchtype = searchtype;
+        s.sc.startseed = seed;
+        s.sc.smin = smin;
+        s.sc.smax = smax;
+        s.sc.threads = threadcnt;
+        s.gen48 = gen48;
+        s.cv = condtree.condvec;
+        s.slist = slist;
+        coordinator->setSession(s);
+        // Set SearchMaster reference so coordinator can pull tasks from shared queue
+        coordinator->setSearchMaster(this);
+
+        coordinator->startSearch();
+    }
+
+    // Start local workers; coordinator will pull from this shared queue to avoid duplication
     for (int i = 0; i < threadcnt; i++)
     {
         SearchWorker *worker = new SearchWorker(this);
         QObject::connect(
             worker, &SearchWorker::result,
-            this, &SearchMaster::onWorkerResult,
+            this, static_cast<void (SearchMaster::*)(uint64_t)>(&SearchMaster::onWorkerResult),
             Qt::BlockingQueuedConnection);
         QObject::connect(
             worker, &SearchWorker::finished,
@@ -617,6 +705,12 @@ void SearchMaster::startSearch()
 void SearchMaster::stopSearch()
 {
     stop = true;
+    
+    if (coordinator)
+    {
+        coordinator->stopSearch();
+    }
+    
     if (workers.empty())
         return;
 
@@ -685,6 +779,17 @@ bool SearchMaster::getProgress(QString *status, uint64_t *prog, uint64_t *end, u
         {
             *prog = worker->prog;
             *seed = worker->seed;
+            valid = true;
+        }
+    }
+    
+    // Add distributed worker progress from coordinator
+    if (coordinator && coordinator->isConnected())
+    {
+        uint64_t coordProg, coordEnd, coordSeed;
+        if (coordinator->getProgress(&coordProg, &coordEnd, &coordSeed))
+        {
+            *prog += coordProg;  // Add coordinator's cumulative progress
             valid = true;
         }
     }
@@ -769,6 +874,52 @@ bool SearchMaster::getProgress(QString *status, uint64_t *prog, uint64_t *end, u
         .arg(eta);
 
     return valid;
+}
+
+void SearchMaster::getProfilingData(std::vector<Condition>& conditions)
+{
+    QMutexLocker locker(&mutex);
+    
+    // Aggregate profiling data from all local workers
+    std::map<int, SearchThreadEnv::ConditionProfile> aggregated;
+    
+    for (SearchWorker* worker : workers)
+    {
+        for (const auto& it : worker->env.cond_profiles)
+        {
+            int save_idx = it.first;
+            const auto& prof = it.second;
+            
+            auto& agg = aggregated[save_idx];
+            
+            // Accumulate means (we'll average them)
+            if (prof.mean_ns > 0)
+            {
+                agg.mean_ns += prof.mean_ns;
+                agg.test_count++;
+            }
+            
+            // Track max of medians
+            if (prof.median_ns > agg.median_ns)
+                agg.median_ns = prof.median_ns;
+            
+            // Track overall max
+            if (prof.max_ns > agg.max_ns)
+                agg.max_ns = prof.max_ns;
+        }
+    }
+    
+    // Update the conditions with aggregated profiling data
+    for (Condition& cond : conditions)
+    {
+        if (aggregated.find(cond.save) != aggregated.end())
+        {
+            const auto& agg = aggregated[cond.save];
+            cond.prof_mean_ns = agg.test_count > 0 ? agg.mean_ns / agg.test_count : 0;
+            cond.prof_median_ns = agg.median_ns;
+            cond.prof_max_ns = agg.max_ns;
+        }
+    }
 }
 
 bool SearchMaster::requestItem(SearchWorker *item)
@@ -902,7 +1053,14 @@ bool SearchMaster::requestItem(SearchWorker *item)
 
 void SearchMaster::onWorkerResult(uint64_t seed)
 {
-    emit searchResult(seed);
+    // This is from a local worker
+    emit searchResult(seed, QString("Local"));
+}
+
+void SearchMaster::onWorkerResult(uint64_t seed, const QString& source)
+{
+    // This is from a remote worker via the coordinator
+    emit searchResult(seed, source);
 }
 
 void SearchMaster::onWorkerFinished()

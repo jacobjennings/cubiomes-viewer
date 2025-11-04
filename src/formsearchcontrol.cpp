@@ -5,6 +5,7 @@
 #include "message.h"
 #include "rangedialog.h"
 #include "search.h"
+#include "searchcoordinator.h"
 #include "util.h"
 #include "cubiomes/finders.h"
 
@@ -25,6 +26,8 @@ QVariant SeedTableModel::data(const QModelIndex& index, int role) const
             return seeds[index.row()].txtHex48;
         if (index.column() == COL_TOP16)
             return seeds[index.row()].txtTop16;
+        if (index.column() == COL_SOURCE)
+            return seeds[index.row()].source;
     }
     else if (role == Qt::UserRole)
     {
@@ -37,7 +40,7 @@ QVariant SeedTableModel::data(const QModelIndex& index, int role) const
     else if (role == Qt::TextAlignmentRole)
     {
         static QVariant align = QVariant::fromValue((int)Qt::AlignRight | Qt::AlignVCenter);
-        if (index.column() != COL_HEX48)
+        if (index.column() != COL_HEX48 && index.column() != COL_SOURCE)
             return align;
     }
     return QVariant();
@@ -57,13 +60,15 @@ QVariant SeedTableModel::headerData(int section, Qt::Orientation orientation, in
             return QVariant::fromValue(tr("top 16"));
         if (section == COL_HEX48)
             return QVariant::fromValue(tr("lower 48 bit"));
+        if (section == COL_SOURCE)
+            return QVariant::fromValue(tr("source"));
     }
     if (role == Qt::DisplayRole && orientation == Qt::Vertical)
         return QVariant::fromValue(section + 1);
     return QVariant();
 }
 
-int SeedTableModel::insertSeeds(QVector<uint64_t> newseeds)
+int SeedTableModel::insertSeeds(QVector<uint64_t> newseeds, const QString& source)
 {
     int row = seeds.size();
     beginInsertRows(QModelIndex(), row, row + newseeds.size()-1);
@@ -71,6 +76,7 @@ int SeedTableModel::insertSeeds(QVector<uint64_t> newseeds)
     {
         Seed s;
         s.seed = seed;
+        s.source = source;
         s.varSeed = QVariant::fromValue(seed);
         s.varTop16 = QVariant::fromValue((quint64)(seed>>48) & 0xFFFF);
         s.varHex48 = QVariant::fromValue((quint64)(seed & MASK48));
@@ -166,6 +172,11 @@ FormSearchControl::FormSearchControl(MainWindow *parent)
     
     // Populate initial center-on filter list
     updateCenterOnFilterList();
+    
+    // Start the coordinator server immediately to accept worker connections
+    // Workers can connect at any time, not just when a search is running
+    QStringList workerHosts = getWorkerHosts();
+    sthread.setWorkers(workerHosts, 23473);
 }
 
 FormSearchControl::~FormSearchControl()
@@ -367,6 +378,31 @@ bool FormSearchControl::getSeed(int row, uint64_t *seed)
     return true;
 }
 
+QStringList FormSearchControl::getWorkerHosts() const
+{
+    QString text = ui->textWorkers->toPlainText().trimmed();
+    if (text.isEmpty())
+        return QStringList();
+    
+    QStringList hosts;
+    // Split by newlines and commas
+    QStringList lines = text.split(QRegExp("[,\n]"), Qt::SkipEmptyParts);
+    for (const QString& line : lines)
+    {
+        QString host = line.trimmed();
+        if (!host.isEmpty())
+            hosts.append(host);
+    }
+    return hosts;
+}
+
+void FormSearchControl::setWorkerHosts(const QStringList& hosts)
+{
+    ui->textWorkers->setPlainText(hosts.join("\n"));
+    // Also update the coordinator with the new hostnames
+    sthread.setWorkers(hosts, 23473);
+}
+
 
 void FormSearchControl::on_buttonClear_clicked()
 {
@@ -411,6 +447,11 @@ void FormSearchControl::on_buttonStart_clicked()
 
         if (ok)
         {
+            // Set up distributed workers coordinator (connects to worker servers)
+            // Workers listen on the specified port, coordinator connects to them
+            QStringList workerHosts = getWorkerHosts();
+            sthread.setWorkers(workerHosts, 23473); // Default port 23473
+            
             if (!resultfile.fileName().isEmpty())
             {
                 resultfile.close();
@@ -594,7 +635,9 @@ int FormSearchControl::pasteList(bool dummy)
 
     if (!seeds.empty())
     {
-        return searchResultsAdd(seeds, dummy);
+        // Pasted seeds are considered "Local" since they're manually added
+        std::vector<QString> sources(seeds.size(), QString("Local"));
+        return searchResultsAdd(seeds, sources, dummy);
     }
     return 0;
 }
@@ -621,7 +664,7 @@ void FormSearchControl::onSort(int, Qt::SortOrder)
     }
 }
 
-void FormSearchControl::searchResult(uint64_t seed)
+void FormSearchControl::searchResult(uint64_t seed, const QString& source)
 {
     if (resultfile.isOpen())
     {
@@ -632,10 +675,13 @@ void FormSearchControl::searchResult(uint64_t seed)
     }
 
     qbuf.push_back(seed);
+    qbuf_sources.push_back(source);
+    
     if (ui->checkStop->isChecked())
     {
-        searchResultsAdd(qbuf, false);
+        searchResultsAdd(qbuf, qbuf_sources, false);
         qbuf.clear();
+        qbuf_sources.clear();
         return;
     }
 
@@ -651,8 +697,9 @@ void FormSearchControl::onBufferTimeout()
 {
     uint64_t t = -elapsed.elapsed();
 
-    searchResultsAdd(qbuf, false);
+    searchResultsAdd(qbuf, qbuf_sources, false);
     qbuf.clear();
+    qbuf_sources.clear();
 
     QApplication::processEvents(); // force processing of events so we can time correctly
 
@@ -662,10 +709,18 @@ void FormSearchControl::onBufferTimeout()
     nextupdate = elapsed.nsecsElapsed() + 1e6 * updt;
 }
 
-int FormSearchControl::searchResultsAdd(std::vector<uint64_t> seeds, bool countonly)
+int FormSearchControl::searchResultsAdd(std::vector<uint64_t> seeds, const std::vector<QString>& sources, bool countonly)
 {
     if (seeds.empty())
         return 0;
+    
+    // Ensure seeds and sources have matching sizes
+    if (seeds.size() != sources.size())
+    {
+        qWarning() << "searchResultsAdd: seeds and sources size mismatch";
+        return 0;
+    }
+    
     const Config& config = parent->config;
     int n = model->seeds.size();
     int nold = n;
@@ -681,29 +736,72 @@ int FormSearchControl::searchResultsAdd(std::vector<uint64_t> seeds, bool counto
         sthread.stopSearch();
         discarded = true;
         seeds.resize(config.maxMatching - n);
+        // Also resize sources to match
+        const_cast<std::vector<QString>&>(sources).resize(config.maxMatching - n);
     }
 
+    // Track existing seeds and their sources to detect duplicates across local/remote
     QSet<uint64_t> current;
     current.reserve(n + seeds.size());
+    QHash<uint64_t, QString> existingSource;
+    existingSource.reserve(n + seeds.size());
     for (int i = 0; i < n; i++)
-        current.insert(model->seeds[i].seed);
+    {
+        const auto &s = model->seeds[i];
+        current.insert(s.seed);
+        existingSource.insert(s.seed, s.source);
+    }
+
+    // Detect duplicates within the incoming batch
+    QSet<uint64_t> batchSeen;
+    batchSeen.reserve((int)seeds.size());
 
     QVector<uint64_t> newseeds;
-    for (uint64_t s : seeds)
+    QVector<QString> newsources;
+    for (size_t i = 0; i < seeds.size(); i++)
     {
-        if (current.contains(s))
+        uint64_t s = seeds[i];
+        // Check for duplicates within this batch first
+        if (batchSeen.contains(s))
+        {
+            qCritical() << "ERROR: Duplicate seed detected within batch:" << s;
+            warn(this, tr("Duplicate seed detected within batch: %1").arg(QString::number((qint64)s)));
             continue;
+        }
+        batchSeen.insert(s);
+
+        // Check for duplicates against existing list (e.g., local vs remote overlap)
+        if (current.contains(s))
+        {
+            const QString prevSrc = existingSource.value(s);
+            const QString newSrc = sources[i];
+            if (prevSrc != newSrc)
+            {
+                qCritical() << "ERROR: Duplicate seed from different sources:" << s << "existing:" << prevSrc << "new:" << newSrc;
+                warn(this, tr("Duplicate seed from different sources: %1 (existing: %2, new: %3)")
+                                .arg(QString::number((qint64)s), prevSrc, newSrc));
+            }
+            continue;
+        }
         if (!countonly)
         {
             current.insert(s);
+            existingSource.insert(s, sources[i]);
             newseeds.append(s);
+            newsources.append(sources[i]);
         }
         n++;
     }
     if (!newseeds.empty())
     {
         ui->results->setSortingEnabled(false);
-        model->insertSeeds(newseeds);
+        // Insert seeds with their individual sources
+        for (int i = 0; i < newseeds.size(); i++)
+        {
+            QVector<uint64_t> singleSeed;
+            singleSeed.append(newseeds[i]);
+            model->insertSeeds(singleSeed, newsources[i]);
+        }
         ui->results->setSortingEnabled(true);
     }
 
@@ -833,6 +931,50 @@ void FormSearchControl::progressTimeout()
     updateSearchProgress(prog, end, seed);
 
     ui->labelStatus->setText(status);
+    
+    // Update profiling display with local worker data
+    if (parent && parent->formCond)
+    {
+        std::vector<Condition> conditions = parent->formCond->getConditions();
+        sthread.getProfilingData(conditions);
+        parent->formCond->updateProfilingDisplay(conditions);
+    }
+    
+    // Update worker statistics if coordinator is active
+    if (sthread.coordinator && sthread.coordinator->isConnected())
+    {
+        QVector<SearchCoordinator::WorkerStats> stats = sthread.coordinator->getWorkerStats();
+        if (!stats.isEmpty())
+        {
+            QStringList statLines;
+            for (const auto& ws : stats)
+            {
+                QString hostname = ws.hostname.isEmpty() ? tr("unknown") : ws.hostname;
+                QString state = ws.isActive ? tr("active") : tr("idle");
+                QString rateStr;
+                if (ws.seedsPerSecond > 1000000)
+                    rateStr = QString::asprintf("%.2f M", ws.seedsPerSecond / 1000000.0);
+                else if (ws.seedsPerSecond > 1000)
+                    rateStr = QString::asprintf("%.2f K", ws.seedsPerSecond / 1000.0);
+                else
+                    rateStr = QString::asprintf("%.1f", ws.seedsPerSecond);
+                
+                statLines.append(QString("%1: %2 seeds/sec (%3)")
+                                 .arg(hostname)
+                                 .arg(rateStr)
+                                 .arg(state));
+            }
+            ui->labelWorkerStats->setText(statLines.join("\n"));
+        }
+        else
+        {
+            ui->labelWorkerStats->setText(tr("No workers connected"));
+        }
+    }
+    else
+    {
+        ui->labelWorkerStats->setText(QString());
+    }
 
     update();
 }

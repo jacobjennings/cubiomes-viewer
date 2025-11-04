@@ -4,7 +4,7 @@
 #
 #-------------------------------------------------
 
-QT += core widgets
+QT += core widgets network
 
 # uncomment to override the profile compiler
 #QMAKE_CC = clang
@@ -127,6 +127,8 @@ SOURCES += \
         src/scripts.cpp \
         src/search.cpp \
         src/searchthread.cpp \
+        src/searchcoordinator.cpp \
+        src/searchworkerclient.cpp \
         src/tabbiomes.cpp \
         src/tablocations.cpp \
         src/tabstructures.cpp \
@@ -193,6 +195,9 @@ HEADERS += \
         src/scripts.h \
         src/search.h \
         src/searchthread.h \
+        src/searchprotocol.h \
+        src/searchcoordinator.h \
+        src/searchworkerclient.h \
         src/seedtables.h \
         src/tabbiomes.h \
         src/tablocations.h \

@@ -13,6 +13,9 @@
 
 #include <deque>
 
+class SearchCoordinator;
+class SearchWorkerClient;
+
 struct Session
 {
     void writeHeader(QTextStream& stream);
@@ -37,6 +40,9 @@ public:
     virtual ~SearchMaster();
 
     bool set(QWidget *widget, const Session& s);
+    
+    void setWorkers(const QStringList& workerHosts, quint16 port = 23473);
+    void clearWorkers();
 
     void preSearch();
 
@@ -53,14 +59,18 @@ public:
     //  avg     : search speed average
     bool getProgress(QString *status, uint64_t *prog, uint64_t *end, uint64_t *seed, qreal *min, qreal *avg, qreal *max);
 
+    // Get aggregated profiling data from local workers
+    void getProfilingData(std::vector<Condition>& conditions);
+
     bool requestItem(SearchWorker *item);
 
 public slots:
     void onWorkerResult(uint64_t seed);
+    void onWorkerResult(uint64_t seed, const QString& source);
     void onWorkerFinished();
 
 signals:
-    void searchResult(uint64_t seed);
+    void searchResult(uint64_t seed, const QString& source);
     void searchFinish(bool done);
 
 public:
@@ -94,6 +104,12 @@ public:
     uint64_t                    smin;
     uint64_t                    smax;
     bool                        isdone;
+    
+    // Distributed search support
+    SearchCoordinator          *coordinator;
+    QStringList                workerHosts;
+    quint16                    workerPort;
+    SearchWorkerClient        *localWorkerClient;
 };
 
 
@@ -125,8 +141,7 @@ public:
     // the end seed is the highest unsigned seed value in the search space
     // (or the last entry in the seed list)
 
-private:
-    SearchThreadEnv     env;
+    SearchThreadEnv     env;        // public for profiling data access
 };
 
 

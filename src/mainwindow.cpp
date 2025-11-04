@@ -496,6 +496,10 @@ void MainWindow::saveSettings()
     {
         saveSession(sessionpath, true);
     }
+    
+    // Save worker hostnames
+    QStringList workerHosts = formControl->getWorkerHosts();
+    settings.setValue("search/workerHosts", workerHosts);
 }
 
 
@@ -561,6 +565,13 @@ void MainWindow::loadSettings()
     if (config.restoreSession && QFile::exists(sessionpath))
     {
         loadSession(sessionpath, false);
+    }
+    
+    // Load worker hostnames
+    QStringList workerHosts = settings.value("search/workerHosts", QStringList()).toStringList();
+    if (!workerHosts.isEmpty())
+    {
+        formControl->setWorkerHosts(workerHosts);
     }
 }
 
@@ -645,7 +656,9 @@ bool MainWindow::loadSession(QTextStream& stream, bool keepresults, bool quiet)
     if (!keepresults)
         formControl->on_buttonClear_clicked();
     formControl->setSearchConfig(session.sc, quiet);
-    formControl->searchResultsAdd(session.slist, false);
+    // Session seeds are loaded from file, mark as "Local"
+    std::vector<QString> sources(session.slist.size(), QString("Local"));
+    formControl->searchResultsAdd(session.slist, sources, false);
     formControl->searchProgressReset();
 
     // Restore TabBiomes center-on selection
@@ -999,7 +1012,9 @@ void MainWindow::on_actionAddShadow_triggered()
     shadows.reserve(results.size());
     for (uint64_t s : results)
         shadows.push_back( getShadow(s) );
-    formControl->searchResultsAdd(shadows, false);
+    // Shadow seeds are generated locally
+    std::vector<QString> sources(shadows.size(), QString("Local"));
+    formControl->searchResultsAdd(shadows, sources, false);
 }
 
 void MainWindow::on_actionExtGen_triggered()

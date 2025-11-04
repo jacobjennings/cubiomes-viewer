@@ -101,6 +101,34 @@ std::vector<Condition> FormConditions::getConditions() const
     return conds;
 }
 
+void FormConditions::updateProfilingDisplay(const std::vector<Condition>& conditions)
+{
+    // Update each item in the list with new profiling data
+    for (int i = 0, ie = ui->listConditions->count(); i < ie; i++)
+    {
+        QListWidgetItem* item = ui->listConditions->item(i);
+        Condition c = qvariant_cast<Condition>(item->data(Qt::UserRole));
+        
+        // Find matching condition in the provided list by save index
+        for (const Condition& new_cond : conditions)
+        {
+            if (new_cond.save == c.save)
+            {
+                // Update profiling data
+                c.prof_mean_ns = new_cond.prof_mean_ns;
+                c.prof_median_ns = new_cond.prof_median_ns;
+                c.prof_max_ns = new_cond.prof_max_ns;
+                
+                // Update display text
+                QString s = c.summary(true);
+                item->setText(s);
+                item->setData(Qt::UserRole, QVariant::fromValue(c));
+                break;
+            }
+        }
+    }
+}
+
 void FormConditions::updateSensitivity()
 {
     if (!parent)

@@ -37,6 +37,8 @@ public:
     std::vector<Condition> getConditions() const;
     void updateSensitivity();
     int getIndex(int idx) const;
+    
+    void updateProfilingDisplay(const std::vector<Condition>& conditions);
 
     void clearSelection();
 

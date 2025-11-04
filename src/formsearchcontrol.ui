@@ -98,7 +98,7 @@ QPushButton:hover {
        </property>
       </widget>
      </item>
-     <item row="4" column="0" colspan="7">
+     <item row="6" column="0" colspan="7">
       <widget class="QLabel" name="labelStatus">
        <property name="font">
         <font>
@@ -198,7 +198,48 @@ QPushButton:hover {
        </property>
       </widget>
      </item>
-     <item row="3" column="0" colspan="7">
+     <item row="5" column="0" colspan="7">
+      <widget class="QGroupBox" name="groupWorkers">
+       <property name="title">
+        <string>Distributed Workers (optional)</string>
+       </property>
+       <layout class="QVBoxLayout" name="verticalLayoutWorkers">
+        <item>
+         <widget class="QLabel" name="labelWorkers">
+          <property name="text">
+           <string>Worker hostnames (one per line or comma-separated):</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPlainTextEdit" name="textWorkers">
+          <property name="maximumBlockCount">
+           <number>100</number>
+          </property>
+          <property name="toolTip">
+           <string>Enter hostnames or IP addresses of worker machines. Workers must be started with --worker-mode option.</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="labelWorkerStats">
+          <property name="font">
+           <font>
+            <family>Monospace</family>
+           </font>
+          </property>
+          <property name="text">
+           <string/>
+          </property>
+          <property name="toolTip">
+           <string>Real-time processing speed for each connected worker</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item row="4" column="0" colspan="7">
       <widget class="QProgressBar" name="progressBar">
        <property name="font">
         <font>

@@ -29,7 +29,7 @@ public:
     explicit SeedTableModel(QObject *parent = nullptr) :
         QAbstractTableModel(parent) {}
 
-    enum { COL_SEED, COL_TOP16, COL_HEX48, COL_MAX };
+    enum { COL_SEED, COL_TOP16, COL_HEX48, COL_SOURCE, COL_MAX };
 
     virtual int rowCount(const QModelIndex&) const override { return seeds.size(); }
     virtual int columnCount(const QModelIndex&) const override { return COL_MAX; }
@@ -37,13 +37,14 @@ public:
     virtual QVariant data(const QModelIndex& index, int role) const override;
     virtual QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
 
-    int insertSeeds(QVector<uint64_t> seeds);
+    int insertSeeds(QVector<uint64_t> seeds, const QString& source = QString("Local"));
     void removeRow(int row);
     void reset();
 
     struct Seed
     {
         uint64_t seed;
+        QString source;
         QVariant varSeed, varHex48, varTop16;
         QVariant txtSeed, txtHex48, txtTop16;
     };
@@ -113,6 +114,9 @@ public:
     void searchLockUi(bool lock);
 
     void setSearchMode(int mode);
+    
+    QStringList getWorkerHosts() const;
+    void setWorkerHosts(const QStringList& hosts);
 
     bool getSeed(int row, uint64_t *seed);
     
@@ -145,8 +149,8 @@ public slots:
     void pasteResults();
     int pasteList(bool dummy);
     void onBufferTimeout();
-    void searchResult(uint64_t seed);
-    int searchResultsAdd(std::vector<uint64_t> seeds, bool countonly);
+    void searchResult(uint64_t seed, const QString& source);
+    int searchResultsAdd(std::vector<uint64_t> seeds, const std::vector<QString>& sources, bool countonly);
     void searchProgressReset();
     void updateSearchProgress(uint64_t last, uint64_t end, int64_t seed);
     void searchFinish(bool done);
@@ -178,6 +182,7 @@ private:
 
     // found seeds that are waiting to be added to results
     std::vector<uint64_t> qbuf;
+    std::vector<QString> qbuf_sources;
     quint64 nextupdate;
     quint64 updt;
     
