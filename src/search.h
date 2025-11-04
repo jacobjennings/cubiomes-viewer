@@ -646,6 +646,11 @@ struct /*__attribute__((packed))*/ Condition
     // generated members - initialized when the search is started
     uint8_t     generated_start[0]; // address dummy
     BiomeFilter bf;
+    
+    // profiling data (transient, not saved)
+    int64_t     prof_mean_ns;
+    int64_t     prof_median_ns;
+    int64_t     prof_max_ns;
 
     // perform version upgrades
     bool versionUpgrade();
@@ -707,6 +712,19 @@ struct SearchThreadEnv
     std::atomic_bool *stop;
 
     std::map<uint64_t, lua_State*> l_states;
+
+    // Profiling data for conditions (local to this thread)
+    struct ConditionProfile {
+        std::vector<int64_t> samples;  // timing samples in nanoseconds
+        int64_t mean_ns;
+        int64_t median_ns;
+        int64_t max_ns;
+        uint64_t test_count;
+        ConditionProfile() : mean_ns(0), median_ns(0), max_ns(0), test_count(0) {}
+    };
+    std::map<int, ConditionProfile> cond_profiles; // keyed by condition save index
+    uint64_t total_tests;  // total number of seed tests
+    uint64_t last_profile_update; // last test count when we updated profiles
 
     SearchThreadEnv();
     ~SearchThreadEnv();

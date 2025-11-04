@@ -14,81 +14,106 @@
 #include <QScrollBar>
 #include <QTextStream>
 
+#include <random>
 #include <unordered_set>
 
-void AnalysisBiomes::run()
+// AnalysisBiomes destructor
+AnalysisBiomes::~AnalysisBiomes()
+{
+    stopAnalysis();
+    wait();
+}
+
+void AnalysisBiomes::start()
 {
     stop = false;
-
-    Generator g;
-    setupGenerator(&g, wi.mc, wi.large);
+    idx = 0;
+    workersFinished = 0;
     
-    // Initialize condition environment if centering is enabled
-    centerCondEnv = nullptr;
-    centerCond = nullptr;
+    // Initialize condition tree if centering is enabled
     if (dat.centerOnCondSave > 0 && !centerConds.empty())
     {
-        // Check if target condition exists (conditions were passed from GUI thread)
-        bool found = false;
-        for (const Condition& c : centerConds)
+        QString err = condtree.set(centerConds, wi.mc);
+        if (!err.isEmpty())
         {
-            if (c.save == dat.centerOnCondSave && !(c.meta & Condition::DISABLED))
-            {
-                found = true;
-                break;
-            }
+            condtree.condvec.clear();
         }
-        
-        if (found)
-        {
-            // Create condition tree (needed for relative references)
-            ConditionTree tree;
-            QString err = tree.set(centerConds, wi.mc);
-            if (err.isEmpty())
-            {
-                // Initialize search environment once (expensive operation)
-                centerCondEnv = new SearchThreadEnv();
-                err = centerCondEnv->init(wi.mc, wi.large, tree);
-                if (err.isEmpty())
-                {
-                    // Find the condition in the tree's condvec (conditions are indexed by save)
-                    // Note: condvec uses save as index, but we need to search to be safe
-                    for (size_t i = 0; i < centerCondEnv->condtree.condvec.size(); i++)
-                    {
-                        const Condition& c = centerCondEnv->condtree.condvec[i];
-                        if (c.save == dat.centerOnCondSave && !(c.meta & Condition::DISABLED))
-                        {
-                            centerCond = &c;
-                            break;
-                        }
-                    }
-                    if (!centerCond)
-                    {
-                        // Condition not found in tree, clean up
-                        delete centerCondEnv;
-                        centerCondEnv = nullptr;
-                    }
-                }
-                else
-                {
-                    delete centerCondEnv;
-                    centerCondEnv = nullptr;
-                }
-            }
-        }
-    }
-
-    for (idx = 0; idx < (long)seeds.size(); idx++)
-    {
-        if (stop) break;
-        wi.seed = seeds[idx];
-        if (dat.locate >= 0)
-            runLocate(&g);
-        else
-            runStatistics(&g);
     }
     
-    // Clean up cached environment
+    // Determine number of threads to use
+    threadcnt = QThread::idealThreadCount();
+    if (threadcnt <= 0)
+        threadcnt = 1;
+    // Limit to number of seeds if we have fewer seeds than threads
+    if ((size_t)threadcnt > seeds.size())
+        threadcnt = seeds.size();
+    
+    // Create and start worker threads
+    for (int i = 0; i < threadcnt; i++)
+    {
+        AnalysisBiomesWorker *worker = new AnalysisBiomesWorker(this);
+        
+        // Connect worker signals to master signals (forward to GUI)
+        connect(worker, &AnalysisBiomesWorker::seedDone, 
+                this, &AnalysisBiomes::seedDone, Qt::QueuedConnection);
+        connect(worker, &AnalysisBiomesWorker::seedItem, 
+                this, &AnalysisBiomes::seedItem, Qt::QueuedConnection);
+        connect(worker, &AnalysisBiomesWorker::finished,
+                this, &AnalysisBiomes::onWorkerFinished, Qt::QueuedConnection);
+        
+        workers.push_back(worker);
+        worker->start();
+    }
+}
+
+void AnalysisBiomes::stopAnalysis()
+{
+    stop = true;
+}
+
+void AnalysisBiomes::wait()
+{
+    for (AnalysisBiomesWorker *worker : workers)
+    {
+        if (worker->isRunning())
+            worker->wait();
+        delete worker;
+    }
+    workers.clear();
+}
+
+bool AnalysisBiomes::isRunning() const
+{
+    for (AnalysisBiomesWorker *worker : workers)
+    {
+        if (worker->isRunning())
+            return true;
+    }
+    return false;
+}
+
+void AnalysisBiomes::onWorkerFinished()
+{
+    QMutexLocker locker(&mutex);
+    workersFinished++;
+    if (workersFinished >= threadcnt)
+    {
+        // All workers finished
+        emit finished();
+    }
+}
+
+// Worker implementation
+AnalysisBiomesWorker::AnalysisBiomesWorker(AnalysisBiomes *master)
+    : QThread(nullptr)
+    , master(master)
+    , centerCondEnv(nullptr)
+    , centerCond(nullptr)
+{
+}
+
+AnalysisBiomesWorker::~AnalysisBiomesWorker()
+{
     if (centerCondEnv)
     {
         delete centerCondEnv;
@@ -96,17 +121,79 @@ void AnalysisBiomes::run()
     }
 }
 
-void AnalysisBiomes::runStatistics(Generator *g)
+bool AnalysisBiomesWorker::getNextSeed(uint64_t *seed)
+{
+    long i = master->idx.fetch_add(1);
+    if (i < (long)master->seeds.size())
+    {
+        *seed = master->seeds[i];
+        return true;
+    }
+    return false;
+}
+
+void AnalysisBiomesWorker::run()
+{
+    setupGenerator(&g, master->wi.mc, master->wi.large);
+    
+    // Initialize condition environment if centering is enabled
+    if (master->dat.centerOnCondSave > 0 && !master->condtree.condvec.empty())
+    {
+        centerCondEnv = new SearchThreadEnv();
+        QString err = centerCondEnv->init(master->wi.mc, master->wi.large, master->condtree);
+        if (err.isEmpty())
+        {
+            // Find the condition in the tree's condvec
+            for (const Condition& c : master->condtree.condvec)
+            {
+                if (c.save == master->dat.centerOnCondSave && !(c.meta & Condition::DISABLED))
+                {
+                    centerCond = &c;
+                    break;
+                }
+            }
+            if (!centerCond)
+            {
+                delete centerCondEnv;
+                centerCondEnv = nullptr;
+            }
+        }
+        else
+        {
+            delete centerCondEnv;
+            centerCondEnv = nullptr;
+        }
+    }
+    
+    // Process seeds
+    uint64_t seed;
+    while (!master->stop && getNextSeed(&seed))
+    {
+        if (master->dat.locate >= 0)
+            runLocate(seed);
+        else
+            runStatistics(seed);
+    }
+    
+    // Cleanup
+    if (centerCondEnv)
+    {
+        delete centerCondEnv;
+        centerCondEnv = nullptr;
+    }
+}
+
+void AnalysisBiomesWorker::runStatistics(uint64_t seed)
 {
     QVector<uint64_t> idcnt(258);
     
     // Get structure position offset if center-on condition is selected
     int offsetX = 0, offsetZ = 0;
-    if (dat.centerOnCondSave > 0 && centerCondEnv && centerCond)
+    if (master->dat.centerOnCondSave > 0 && centerCondEnv && centerCond)
     {
         // Set the seed in the cached environment (reuse the expensive setup)
-        centerCondEnv->setSeed(wi.seed);
-        centerCondEnv->stop = &stop; // Use the thread's stop flag
+        centerCondEnv->setSeed(seed);
+        centerCondEnv->stop = &master->stop; // Use the master's stop flag
         
         // Test condition tree at origin to get structure position
         // Use path buffer to get position for the specific condition (needed for relative references)
@@ -121,10 +208,10 @@ void AnalysisBiomes::runStatistics(Generator *g)
             // Convert structure position from block coordinates to scaled coordinates
             // Calculate shift amount based on scale (scale = 1 << shift)
             int shift = 0;
-            if (dat.scale == 4) shift = 2;
-            else if (dat.scale == 16) shift = 4;
-            else if (dat.scale == 64) shift = 6;
-            else if (dat.scale == 256) shift = 8;
+            if (master->dat.scale == 4) shift = 2;
+            else if (master->dat.scale == 16) shift = 4;
+            else if (master->dat.scale == 64) shift = 6;
+            else if (master->dat.scale == 256) shift = 8;
             // else shift = 0 for scale 1
             
             offsetX = structPos.x >> shift;
@@ -137,29 +224,29 @@ void AnalysisBiomes::runStatistics(Generator *g)
         }
     }
     
-    int w = dat.x2 - dat.x1 + 1;
-    int h = dat.z2 - dat.z1 + 1;
+    int w = master->dat.x2 - master->dat.x1 + 1;
+    int h = master->dat.z2 - master->dat.z1 + 1;
     uint64_t n = w * (uint64_t)h;
 
     for (int d = 0; d < 3; d++)
     {
-        if (dims[d] == DIM_UNDEF)
+        if (master->dims[d] == DIM_UNDEF)
             continue;
-        applySeed(g, dims[d], wi.seed);
+        applySeed(&g, master->dims[d], seed);
 
-        if (dat.samples >= n)
+        if (master->dat.samples >= n)
         {   // full area gen => generate 512x512 areas at a time
             const int step = 512;
-            for (int x = dat.x1; x <= dat.x2 && !stop; x += step)
+            for (int x = master->dat.x1; x <= master->dat.x2 && !master->stop; x += step)
             {
-                for (int z = dat.z1; z <= dat.z2 && !stop; z += step)
+                for (int z = master->dat.z1; z <= master->dat.z2 && !master->stop; z += step)
                 {
-                    int w = dat.x2-x+1 < step ? dat.x2-x+1 : step;
-                    int h = dat.z2-z+1 < step ? dat.z2-z+1 : step;
+                    int w = master->dat.x2-x+1 < step ? master->dat.x2-x+1 : step;
+                    int h = master->dat.z2-z+1 < step ? master->dat.z2-z+1 : step;
                     // Apply offset to analysis coordinates
-                    Range r = {dat.scale, x + offsetX, z + offsetZ, w, h, wi.y, 1};
-                    int *ids = allocCache(g, r);
-                    genBiomes(g, ids, r);
+                    Range r = {master->dat.scale, x + offsetX, z + offsetZ, w, h, master->wi.y, 1};
+                    int *ids = allocCache(&g, r);
+                    genBiomes(&g, ids, r);
                     for (int i = 0; i < w*h; i++)
                         idcnt[ ids[i] & 0xff ]++;
                     free(ids);
@@ -168,47 +255,50 @@ void AnalysisBiomes::runStatistics(Generator *g)
         }
         else
         {   // generate a biome statistic by sampling
+            // Use thread-local RNG seeded by the minecraft seed for deterministic sampling
+            std::mt19937_64 rng(seed);
+            std::uniform_int_distribution<uint64_t> dist(0, n - 1);
             std::vector<uint64_t> order;
 
-            if (dat.samples * 2 >= n)
+            if (master->dat.samples * 2 >= n)
             {   // dense regime => shuffle indeces
                 order.resize(n);
                 for (uint64_t i = 0; i < n; i++)
                     order[i] = i;
                 for (uint64_t i = 0; i < n; i++)
                 {
-                    if (!(i & 0xffff) && stop)
+                    if (!(i & 0xffff) && master->stop)
                         break;
-                    uint64_t idx = getRnd64() % n;
+                    uint64_t idx = dist(rng);
                     uint64_t t = order[i];
                     order[i] = order[idx];
                     order[idx] = t;
                 }
-                order.resize(dat.samples);
+                order.resize(master->dat.samples);
             }
             else
             {   // sparse regime => fill randomly without reuse
                 std::unordered_set<uint64_t> used;
-                order.reserve(dat.samples);
-                used.reserve(dat.samples);
-                for (uint64_t i = 0; order.size() < dat.samples; i++)
+                order.reserve(master->dat.samples);
+                used.reserve(master->dat.samples);
+                for (uint64_t i = 0; order.size() < master->dat.samples; i++)
                 {
-                    if (!(i & 0xffff) && stop)
+                    if (!(i & 0xffff) && master->stop)
                         break;
-                    uint64_t idx = getRnd64() % n;
+                    uint64_t idx = dist(rng);
                     auto it = used.insert(idx);
                     if (it.second)
                         order.push_back(idx);
                 }
             }
 
-            for (uint64_t i = 0; i < dat.samples && !stop; i++)
+            for (uint64_t i = 0; i < master->dat.samples && !master->stop; i++)
             {
                 uint64_t idx = order[i];
                 int x = (int) (idx % w);
                 int z = (int) (idx / w);
                 // Apply offset to analysis coordinates
-                int id = getBiomeAt(g, dat.scale, dat.x1+x+offsetX, wi.y, dat.z1+z+offsetZ);
+                int id = getBiomeAt(&g, master->dat.scale, master->dat.x1+x+offsetX, master->wi.y, master->dat.z1+z+offsetZ);
                 idcnt[ id & 0xff ]++;
             }
         }
@@ -230,29 +320,29 @@ void AnalysisBiomes::runStatistics(Generator *g)
         }
     }
     idcnt[256] = bcnt;
-    // Store water percentage (multiplied by 10000 to avoid floating point, gives 2 decimal precision)
+    // Store water percentage (multiplied by 100 to avoid floating point in the vector)
     idcnt[257] = totalcnt > 0 ? (watercnt * 10000) / totalcnt : 0;
 
-    if (!stop) // discard partially processed seed
-        emit seedDone(wi.seed, idcnt);
+    if (!master->stop) // discard partially processed seed
+        emit seedDone(seed, idcnt);
 }
 
-void AnalysisBiomes::runLocate(Generator *g)
+void AnalysisBiomesWorker::runLocate(uint64_t seed)
 {
-    applySeed(g, DIM_OVERWORLD, wi.seed);
+    applySeed(&g, DIM_OVERWORLD, seed);
     enum { MAX_LOCATE = 4096 };
     Pos pos[MAX_LOCATE];
     int siz[MAX_LOCATE];
-    Range r = {4, dat.x1, dat.z1, dat.x2-dat.x1+1, dat.z2-dat.z1+1, wi.y>>2, 1};
+    Range r = {4, master->dat.x1, master->dat.z1, master->dat.x2-master->dat.x1+1, master->dat.z2-master->dat.z1+1, master->wi.y>>2, 1};
     int n = getBiomeCenters(
-        pos, siz, MAX_LOCATE, g, r, dat.locate, minsize, tolerance,
-        (volatile char*)&stop
+        pos, siz, MAX_LOCATE, &g, r, master->dat.locate, master->minsize, master->tolerance,
+        (volatile char*)&master->stop
     );
-    if (n && !stop)
+    if (n && !master->stop)
     {
         QTreeWidgetItem *seeditem = new QTreeWidgetItem();
-        seeditem->setData(0, Qt::DisplayRole, QVariant::fromValue((qlonglong)wi.seed));
-        seeditem->setData(0, Qt::UserRole+0, QVariant::fromValue(wi.seed));
+        seeditem->setData(0, Qt::DisplayRole, QVariant::fromValue((qlonglong)seed));
+        seeditem->setData(0, Qt::UserRole+0, QVariant::fromValue(seed));
         seeditem->setData(0, Qt::UserRole+1, QVariant::fromValue((int)DIM_OVERWORLD));
         for (int i = 0; i < n; i++)
         {
@@ -261,7 +351,7 @@ void AnalysisBiomes::runLocate(Generator *g)
             item->setData(1, Qt::DisplayRole, QVariant::fromValue(siz[i]));
             item->setData(2, Qt::DisplayRole, QVariant::fromValue(pos[i].x));
             item->setData(3, Qt::DisplayRole, QVariant::fromValue(pos[i].z));
-            item->setData(0, Qt::UserRole+0, QVariant::fromValue(wi.seed));
+            item->setData(0, Qt::UserRole+0, QVariant::fromValue(seed));
             item->setData(0, Qt::UserRole+1, QVariant::fromValue((int)DIM_OVERWORLD));
             item->setData(0, Qt::UserRole+2, QVariant::fromValue(pos[i]));
         }
@@ -278,6 +368,20 @@ QVariant BiomeTableModel::data(const QModelIndex& index, int role) const
     if (role == Qt::TextAlignmentRole)
         return align;
     if (role == Qt::DisplayRole)
+    {
+        int id = ids[index.column()];
+        uint64_t seed = seeds[index.row()];
+        QVariant val = cnt[id][seed];
+        // Special formatting for water percentage column (id 257)
+        if (id == 257 && val.isValid())
+        {
+            uint64_t pct100 = val.toULongLong();
+            return QString::asprintf("%.2f%%", pct100 / 100.0);
+        }
+        return val;
+    }
+    // UserRole+2 is used for sorting - returns raw numeric values
+    if (role == Qt::UserRole+2)
     {
         int id = ids[index.column()];
         uint64_t seed = seeds[index.row()];
@@ -310,7 +414,11 @@ QVariant BiomeTableModel::headerData(int section, Qt::Orientation orientation, i
         if (role == Qt::UserRole)
             return id; // identifier
         if (role == Qt::UserRole+1)
-            return bname ? bname : "#"; // export role
+        {
+            if (id == 257)
+                return "Water%"; // export role for water percentage
+            return bname ? bname : "#";
+        }
         if (role == Qt::DisplayRole)
         {
             if (id == 256)
@@ -319,8 +427,13 @@ QVariant BiomeTableModel::headerData(int section, Qt::Orientation orientation, i
                 return tr("Water %");
             return getBiomeDisplay(cmp.mc, id);
         }
-        if (role == Qt::ToolTipRole && bname)
-            return QVariant::fromValue(QString("%1:%2").arg(id).arg(bname));
+        if (role == Qt::ToolTipRole)
+        {
+            if (id == 257)
+                return tr("Percentage of water biomes (oceans and rivers)");
+            if (bname)
+                return QVariant::fromValue(QString("%1:%2").arg(id).arg(bname));
+        }
     }
     return QVariant();
 }
@@ -468,7 +581,7 @@ TabBiomes::TabBiomes(MainWindow *parent)
     : QWidget(parent)
     , ui(new Ui::TabBiomes)
     , parent(parent)
-    , thread()
+    , thread(new AnalysisBiomes(this))
     , model(new BiomeTableModel(this))
     , proxy(new BiomeSortProxy(this))
     , sortcol(-1)
@@ -479,7 +592,7 @@ TabBiomes::TabBiomes(MainWindow *parent)
 {
     ui->setupUi(this);
     
-    thread.tabbiomes = this;
+    thread->tabbiomes = this;
 
     proxy->setSourceModel(model);
     ui->table->setModel(proxy);
@@ -488,6 +601,10 @@ TabBiomes::TabBiomes(MainWindow *parent)
     ui->table->setHorizontalHeader(header);
     connect(header, &QHeaderView::sortIndicatorChanged, this, &TabBiomes::onTableSort);
     connect(ui->table->verticalHeader(), &QHeaderView::sectionClicked, this, &TabBiomes::onVHeaderClicked);
+    connect(ui->table->selectionModel(), &QItemSelectionModel::currentChanged, this, &TabBiomes::onTableCurrentChanged);
+    
+    // Set selection behavior to select entire rows for consistent navigation
+    ui->table->setSelectionBehavior(QAbstractItemView::SelectRows);
 
     ui->table->setSortingEnabled(true);
 
@@ -505,9 +622,9 @@ TabBiomes::TabBiomes(MainWindow *parent)
     ui->lineTolerance->setValidator(new QIntValidator(0, 255, this));
     ui->lineBiomeSize->setText("1");
 
-    connect(&thread, &AnalysisBiomes::seedDone, this, &TabBiomes::onAnalysisSeedDone, Qt::BlockingQueuedConnection);
-    connect(&thread, &AnalysisBiomes::seedItem, this, &TabBiomes::onAnalysisSeedItem, Qt::BlockingQueuedConnection);
-    connect(&thread, &AnalysisBiomes::finished, this, &TabBiomes::onAnalysisFinished);
+    connect(thread, &AnalysisBiomes::seedDone, this, &TabBiomes::onAnalysisSeedDone);
+    connect(thread, &AnalysisBiomes::seedItem, this, &TabBiomes::onAnalysisSeedItem);
+    connect(thread, &AnalysisBiomes::finished, this, &TabBiomes::onAnalysisFinished);
 
     for (int id = 0; id < 256; id++)
     {
@@ -536,8 +653,12 @@ TabBiomes::TabBiomes(MainWindow *parent)
 
 TabBiomes::~TabBiomes()
 {
-    thread.stop = true;
-    thread.wait(500);
+    if (thread)
+    {
+        thread->stopAnalysis();
+        thread->wait();
+        delete thread;
+    }
     delete ui;
 }
 
@@ -685,6 +806,35 @@ void TabBiomes::onVHeaderClicked(int row)
     }
 }
 
+void TabBiomes::onTableCurrentChanged(const QModelIndex &current, const QModelIndex &previous)
+{
+    (void) previous;
+    if (!current.isValid())
+        return;
+    
+    // Get the row from the current cell
+    int row = current.row();
+    QVariant dat = proxy->headerData(row, Qt::Vertical, Qt::UserRole);
+    if (dat.isValid())
+    {
+        uint64_t seed = dat.toULongLong();
+        WorldInfo wi;
+        parent->getSeed(&wi);
+        wi.seed = seed;
+        parent->setSeed(wi);
+        
+        // If a center-on filter is selected, center the map on that structure
+        if (centerOnConditionSave > 0)
+        {
+            Pos pos;
+            if (parent->formControl->getStructurePosition(seed, centerOnConditionSave, &pos))
+            {
+                parent->getMapView()->setView(pos.x + 0.5, pos.z + 0.5);
+            }
+        }
+    }
+}
+
 void TabBiomes::onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt)
 {
     idcnt.push_back(seed);
@@ -784,7 +934,7 @@ void TabBiomes::onBufferTimeout()
         qbufl.clear();
     }
 
-    QString progress = QString::asprintf(" (%ld/%zu)", thread.idx.load(), thread.seeds.size());
+    QString progress = QString::asprintf(" (%ld/%zu)", thread->idx.load(), thread->seeds.size());
     ui->pushStart->setText(tr("Stop") + progress);
 
     QApplication::processEvents(); // force processing of events so we can time correctly
@@ -797,9 +947,9 @@ void TabBiomes::onBufferTimeout()
 
 void TabBiomes::on_pushStart_clicked()
 {
-    if (thread.isRunning())
+    if (thread->isRunning())
     {
-        thread.stop = true;
+        thread->stopAnalysis();
         return;
     }
 
@@ -807,16 +957,16 @@ void TabBiomes::on_pushStart_clicked()
     nextupdate = 0;
     elapsed.start();
 
-    parent->getSeed(&thread.wi);
-    thread.seeds.clear();
+    parent->getSeed(&thread->wi);
+    thread->seeds.clear();
     if (ui->comboSeedSource->currentIndex() == 0)
-        thread.seeds.push_back(thread.wi.seed);
+        thread->seeds.push_back(thread->wi.seed);
     else
-        thread.seeds = parent->formControl->getResults();
+        thread->seeds = parent->formControl->getResults();
 
-    thread.dims[0] = ui->checkOverworld->isChecked() ? DIM_OVERWORLD : DIM_UNDEF;
-    thread.dims[1] = ui->checkNether->isChecked() ? DIM_NETHER : DIM_UNDEF;
-    thread.dims[2] = ui->checkEnd->isChecked() ? DIM_END : DIM_UNDEF;
+    thread->dims[0] = ui->checkOverworld->isChecked() ? DIM_OVERWORLD : DIM_UNDEF;
+    thread->dims[1] = ui->checkNether->isChecked() ? DIM_NETHER : DIM_UNDEF;
+    thread->dims[2] = ui->checkEnd->isChecked() ? DIM_END : DIM_UNDEF;
 
     int x1 = ui->lineX1->text().toInt();
     int z1 = ui->lineZ1->text().toInt();
@@ -830,11 +980,11 @@ void TabBiomes::on_pushStart_clicked()
 
     if (ui->radioFullSample->isChecked())
     {
-        thread.dat.samples = ~0ULL;
+        thread->dat.samples = ~0ULL;
     }
     else
     {
-        thread.dat.samples = ui->lineSamples->text().toULongLong();
+        thread->dat.samples = ui->lineSamples->text().toULongLong();
         scale = 4;
         s = 2;
     }
@@ -856,47 +1006,47 @@ void TabBiomes::on_pushStart_clicked()
         while (ui->treeLocate->topLevelItemCount() > 0)
             delete ui->treeLocate->takeTopLevelItem(0);
         ui->treeLocate->setSortingEnabled(true);
-        thread.dat.locate = str2biome[ui->comboBiome->currentText()];
-        thread.minsize = ui->lineBiomeSize->text().toInt();
-        thread.tolerance = ui->lineTolerance->text().toInt();
-        if (thread.minsize <= 0)
-            thread.minsize = 1;
+        thread->dat.locate = str2biome[ui->comboBiome->currentText()];
+        thread->minsize = ui->lineBiomeSize->text().toInt();
+        thread->tolerance = ui->lineTolerance->text().toInt();
+        if (thread->minsize <= 0)
+            thread->minsize = 1;
         scale = 4;
         s = 2;
     }
     else
     {
-        model->reset(thread.wi.mc);
-        thread.dat.locate = -1;
+        model->reset(thread->wi.mc);
+        thread->dat.locate = -1;
     }
 
-    thread.dat.scale = scale;
-    thread.dat.x1 = x1 >> s;
-    thread.dat.z1 = z1 >> s;
-    thread.dat.x2 = x2 >> s;
-    thread.dat.z2 = z2 >> s;
-    thread.dat.centerOnCondSave = centerOnConditionSave;
+    thread->dat.scale = scale;
+    thread->dat.x1 = x1 >> s;
+    thread->dat.z1 = z1 >> s;
+    thread->dat.x2 = x2 >> s;
+    thread->dat.z2 = z2 >> s;
+    thread->dat.centerOnCondSave = centerOnConditionSave;
     
     // Get conditions from GUI thread before starting worker thread (thread safety)
     if (centerOnConditionSave > 0)
     {
-        thread.centerConds = parent->formCond->getConditions();
+        thread->centerConds = parent->formCond->getConditions();
     }
     else
     {
-        thread.centerConds.clear();
+        thread->centerConds.clear();
     }
 
-    if (thread.dat.locate < 0)
-        dats = thread.dat;
+    if (thread->dat.locate < 0)
+        dats = thread->dat;
     else
-        datl = thread.dat;
+        datl = thread->dat;
 
     ui->pushExport->setEnabled(false);
     ui->pushStart->setChecked(true);
-    QString progress = QString::asprintf(" (0/%zu)", thread.seeds.size());
+    QString progress = QString::asprintf(" (0/%zu)", thread->seeds.size());
     ui->pushStart->setText(tr("Stop") + progress);
-    thread.start();
+    thread->start();
 }
 
 
@@ -1058,7 +1208,7 @@ void TabBiomes::on_treeLocate_itemClicked(QTreeWidgetItem *item, int column)
 void TabBiomes::on_tabWidget_currentChanged(int)
 {
     bool ok = false;
-    if (!thread.isRunning())
+    if (!thread->isRunning())
     {
         if (ui->tabWidget->currentWidget() == ui->tabStats)
             ok = !model->ids.empty();

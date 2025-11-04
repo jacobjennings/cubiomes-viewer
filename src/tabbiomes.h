@@ -6,6 +6,7 @@
 #include <QTreeWidgetItem>
 #include <QSortFilterProxyModel>
 #include <QHeaderView>
+#include <QMutex>
 
 #include "mainwindow.h"
 #include "util.h"
@@ -15,22 +16,55 @@ class TabBiomes;
 }
 
 class TabBiomes;
-class AnalysisBiomes : public QThread
+class AnalysisBiomes;
+
+// Forward declaration for worker
+class AnalysisBiomesWorker : public QThread
+{
+    Q_OBJECT
+public:
+    explicit AnalysisBiomesWorker(AnalysisBiomes *master);
+    virtual ~AnalysisBiomesWorker();
+    
+    bool getNextSeed(uint64_t *seed);
+    virtual void run() override;
+    
+    void runStatistics(uint64_t seed);
+    void runLocate(uint64_t seed);
+
+signals:
+    void seedDone(uint64_t seed, QVector<uint64_t> cnt);
+    void seedItem(QTreeWidgetItem *item);
+
+private:
+    AnalysisBiomes *master;
+    Generator g;
+    SearchThreadEnv *centerCondEnv;
+    const Condition *centerCond;
+};
+
+class AnalysisBiomes : public QObject
 {
     Q_OBJECT
 public:
     explicit AnalysisBiomes(QObject *parent = nullptr)
-        : QThread(parent), tabbiomes(nullptr), idx(), centerCondEnv(nullptr), centerCond(nullptr) {}
+        : QObject(parent), tabbiomes(nullptr), idx(0), threadcnt(0) {}
+    virtual ~AnalysisBiomes();
 
-    virtual void run() override;
-    void runStatistics(Generator *g);
-    void runLocate(Generator *g);
+    void start();
+    void stopAnalysis();
+    void wait();
+    bool isRunning() const;
     
     TabBiomes *tabbiomes; // reference to parent TabBiomes for structure position lookup
 
 signals:
     void seedDone(uint64_t seed, QVector<uint64_t> cnt);
     void seedItem(QTreeWidgetItem *item);
+    void finished();
+
+public slots:
+    void onWorkerFinished();
 
 public:
     std::vector<uint64_t> seeds;
@@ -51,9 +85,14 @@ public:
     // Conditions passed from GUI thread (for thread safety)
     std::vector<Condition> centerConds;
     
-    // Cached environment and condition for structure position lookup (when centering is enabled)
-    SearchThreadEnv *centerCondEnv;
-    const Condition *centerCond;
+    // Thread management
+    QMutex mutex;
+    std::vector<AnalysisBiomesWorker*> workers;
+    int threadcnt;
+    int workersFinished;
+    
+    // Condition tree for worker initialization
+    ConditionTree condtree;
 };
 
 class BiomeTableModel : public QAbstractTableModel
@@ -89,9 +128,10 @@ public:
 
     virtual bool lessThan(const QModelIndex& a, const QModelIndex& b) const override
     {
-        QVariant av = sourceModel()->data(a, Qt::DisplayRole);
-        QVariant bv = sourceModel()->data(b, Qt::DisplayRole);
-        return bv.toInt() < av.toInt();
+        // Use UserRole+2 for sorting to get raw numeric values
+        QVariant av = sourceModel()->data(a, Qt::UserRole+2);
+        QVariant bv = sourceModel()->data(b, Qt::UserRole+2);
+        return bv.toULongLong() < av.toULongLong();
     }
 
     virtual void sort(int column, Qt::SortOrder order) override
@@ -156,6 +196,7 @@ private slots:
     void onLocateHeaderClick();
     void onTableSort(int column, Qt::SortOrder);
     void onVHeaderClicked(int row);
+    void onTableCurrentChanged(const QModelIndex &current, const QModelIndex &previous);
     void onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt);
     void onAnalysisSeedItem(QTreeWidgetItem *item);
     void onAnalysisFinished();
@@ -176,7 +217,7 @@ private:
 private:
     Ui::TabBiomes *ui;
     MainWindow *parent;
-    AnalysisBiomes thread;
+    AnalysisBiomes *thread;
     BiomeTableModel *model;
     BiomeSortProxy *proxy;
     QMap<QString, int> str2biome;

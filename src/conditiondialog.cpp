@@ -13,11 +13,14 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFontMetricsF>
+#include <QHBoxLayout>
 #include <QInputDialog>
 #include <QIntValidator>
+#include <QLabel>
 #include <QScrollBar>
 #include <QSpacerItem>
 #include <QStandardPaths>
+#include <QWidget>
 #include <QTextStream>
 
 
@@ -634,7 +637,7 @@ void ConditionDialog::updateMode()
             // Set minimum value to 1 (0 doesn't make sense for minimum count)
             ui->spinBox->setMinimum(1);
             // If current value is 0 or invalid, set to 1
-            if (ui->spinBox->value() == 0)
+            if (ui->spinBox->value() < 1)
                 ui->spinBox->setValue(1);
         }
         else
@@ -842,10 +845,39 @@ void ConditionDialog::updateBiomeSelection()
 
     if (ui->stackedWidget->currentWidget() == ui->pageBiomes)
     {
-        // separate available biomes
+        // Helper function to check if biome is a cave biome
+        auto isCaveBiome = [](int id) {
+            return id == dripstone_caves || id == lush_caves || id == deep_dark;
+        };
+        
+        // Helper function to check if biome is a water biome (ocean or river)
+        auto isWaterBiome = [](int id) {
+            return isOceanic(id) || id == river || id == frozen_river;
+        };
+        
+        // separate available biomes into cave, water, and regular
         QLayoutItem *sep = ui->gridLayoutBiomes->takeAt(ui->gridLayoutBiomes->indexOf(separator));
+        
         std::vector<int> unavailable;
+        std::vector<int> availableCave;
+        std::vector<int> availableWater;
+        std::vector<int> availableRegular;
         std::map<int, QLayoutItem*> items;
+        
+        // Split available biomes into cave, water, and regular
+        for (int id : available)
+        {
+            if (isCaveBiome(id))
+                availableCave.push_back(id);
+            else if (isWaterBiome(id))
+                availableWater.push_back(id);
+            else
+                availableRegular.push_back(id);
+        }
+        std::sort(availableCave.begin(), availableCave.end(), cmp);
+        std::sort(availableWater.begin(), availableWater.end(), cmp);
+        std::sort(availableRegular.begin(), availableRegular.end(), cmp);
+        
         for (const auto& it : biomecboxes)
         {
             int id = it.first;
@@ -858,17 +890,91 @@ void ConditionDialog::updateBiomeSelection()
         std::sort(unavailable.begin(), unavailable.end(), cmp);
 
         int row = 0;
-        for (int i = 0, len = available.size(), mod = (len+1)/2; i < len; i++)
+        
+        // Add regular biomes (non-cave, non-water)
+        int regularRows = (availableRegular.size() + 1) / 2;
+        for (int i = 0, len = availableRegular.size(), mod = regularRows; i < len; i++)
         {
-            int id = available[i];
+            int id = availableRegular[i];
             biomecboxes[id]->setEnabled(true);
             QLayoutItem *item = items[id];
             ui->gridLayoutBiomes->addItem(item, row+i%mod, i/mod);
         }
-        row = (available.size() + 1) / 2;
+        row += regularRows;
+        
+        // Add separator between regular and water biomes if both exist
+        if (!availableWater.empty() && !availableRegular.empty())
+        {
+            // Create a labeled separator widget
+            QWidget *sepWidget = new QWidget();
+            QHBoxLayout *sepLayout = new QHBoxLayout(sepWidget);
+            sepLayout->setContentsMargins(4, 2, 4, 2);
+            sepLayout->setSpacing(8);
+            QLabel *label = new QLabel(tr("Water Biomes"));
+            label->setStyleSheet("font-weight: bold;");
+            QFrame *line = new QFrame();
+            line->setFrameShape(QFrame::HLine);
+            line->setFrameShadow(QFrame::Sunken);
+            sepLayout->addWidget(label);
+            sepLayout->addWidget(line, 1);
+            ui->gridLayoutBiomes->addWidget(sepWidget, row, 0, 1, 2);
+            row++;
+        }
+        
+        // Add water biomes
+        if (!availableWater.empty())
+        {
+            int waterRows = (availableWater.size() + 1) / 2;
+            for (int i = 0, len = availableWater.size(), mod = waterRows; i < len; i++)
+            {
+                int id = availableWater[i];
+                biomecboxes[id]->setEnabled(true);
+                QLayoutItem *item = items[id];
+                ui->gridLayoutBiomes->addItem(item, row+i%mod, i/mod);
+            }
+            row += waterRows;
+        }
+        
+        // Add separator between water and cave biomes if both exist
+        if (!availableCave.empty() && (!availableWater.empty() || !availableRegular.empty()))
+        {
+            // Create a labeled separator widget
+            QWidget *sepWidget = new QWidget();
+            QHBoxLayout *sepLayout = new QHBoxLayout(sepWidget);
+            sepLayout->setContentsMargins(4, 2, 4, 2);
+            sepLayout->setSpacing(8);
+            QLabel *label = new QLabel(tr("Cave Biomes"));
+            label->setStyleSheet("font-weight: bold;");
+            QFrame *line = new QFrame();
+            line->setFrameShape(QFrame::HLine);
+            line->setFrameShadow(QFrame::Sunken);
+            sepLayout->addWidget(label);
+            sepLayout->addWidget(line, 1);
+            ui->gridLayoutBiomes->addWidget(sepWidget, row, 0, 1, 2);
+            row++;
+        }
+        
+        // Add cave biomes
+        if (!availableCave.empty())
+        {
+            int caveRows = (availableCave.size() + 1) / 2;
+            for (int i = 0, len = availableCave.size(), mod = caveRows; i < len; i++)
+            {
+                int id = availableCave[i];
+                biomecboxes[id]->setEnabled(true);
+                QLayoutItem *item = items[id];
+                ui->gridLayoutBiomes->addItem(item, row+i%mod, i/mod);
+            }
+            row += caveRows;
+        }
+        
+        // Add separator between available and unavailable biomes
         ui->gridLayoutBiomes->addItem(sep, row, 0, 1, 2);
         row++;
-        for (int i = 0, len = unavailable.size(), mod = (len+1)/2; i < len; i++)
+        
+        // Add unavailable biomes
+        int unavailRows = (unavailable.size() + 1) / 2;
+        for (int i = 0, len = unavailable.size(), mod = unavailRows; i < len; i++)
         {
             int id = unavailable[i];
             biomecboxes[id]->setEnabled(false);
@@ -1127,11 +1233,17 @@ void ConditionDialog::onAccept()
                 }
             }
         }
-        c.count = ui->checkSamplePos->isChecked() ? 1 : 0;
+        // Only set count from checkSamplePos for F_BIOME_SAMPLE
+        // For F_BIOME_COUNT, count was already set from spinBox at line 1117
+        if (c.type == F_BIOME_SAMPLE)
+        {
+            c.count = ui->checkSamplePos->isChecked() ? 1 : 0;
+        }
+        // Otherwise, keep the count value from spinBox (already set at line 1117)
         c.converage = ui->lineCoverage1->text().toFloat() / 100.0;
         c.confidence = ui->lineConfidence1->text().toFloat() / 100.0;
         c.step = 0;
-        if (c.type == F_BIOME || c.type == F_BIOME_NETHER || c.type == F_BIOME_END)
+        if (c.type == F_BIOME || c.type == F_BIOME_NETHER || c.type == F_BIOME_END || c.type == F_BIOME_COUNT)
             c.step = ui->comboScale->currentData().toInt();
         if (c.type == F_BIOME_END && c.step > 64)
             c.step = 64;

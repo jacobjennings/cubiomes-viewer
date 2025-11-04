@@ -16,6 +16,7 @@
 #include <QThread>
 
 #include <algorithm>
+#include <functional>
 
 #define MULTIPLY_CHAR QChar(0xD7)
 
@@ -84,6 +85,17 @@ QString Condition::summary(bool aligntab) const
         if (ft.loc & FilterInfo::LOC_2)
             s += QString::asprintf(",(%d,%d)", x2, z2);
     }
+    
+    // Add profiling information if available
+    if (prof_mean_ns > 0 || prof_median_ns > 0 || prof_max_ns > 0)
+    {
+        // Convert nanoseconds to microseconds for readability
+        double mean_us = prof_mean_ns / 1000.0;
+        double median_us = prof_median_ns / 1000.0;
+        double max_us = prof_max_ns / 1000.0;
+        s += QString::asprintf(" [μ:%.1f/%.1f/%.1f]", mean_us, median_us, max_us);
+    }
+    
     return s;
 }
 
@@ -192,6 +204,12 @@ QString Condition::apply(int mc)
         setupBiomeFilter(&bf, mc, bfflags, 0, 0, ex, exlen, in, inlen);
     else
         setupBiomeFilter(&bf, mc, bfflags, in, inlen, ex, exlen, 0, 0);
+    
+    // Initialize profiling data
+    prof_mean_ns = 0;
+    prof_median_ns = 0;
+    prof_max_ns = 0;
+    
     return "";
 }
 
@@ -228,8 +246,12 @@ QString ConditionTree::set(const std::vector<Condition>& cv, int mc)
 {
     int cmax = 0;
     for (const Condition& c : cv)
+    {
+        if (c.save < 0)
+            return QApplication::translate("Filter", "Invalid condition with negative save index: %1").arg(c.save);
         if (!(c.meta & Condition::DISABLED) && c.save > cmax)
             cmax = c.save;
+    }
     condvec.clear();
     condvec.resize(cmax + 1);
     references.clear();
@@ -242,9 +264,12 @@ QString ConditionTree::set(const std::vector<Condition>& cv, int mc)
         QString err = condvec[c.save].apply(mc);
         if (!err.isEmpty())
             return err;
-        if (c.relative <= cmax)
+        if (c.relative >= 0 && c.relative <= cmax && c.save != c.relative)
+        {
             references[c.relative].push_back(c.save);
+        }
     }
+    
     return "";
 }
 
@@ -258,6 +283,9 @@ SearchThreadEnv::SearchThreadEnv()
 , searchpass(PASS_FAST_48)
 , stop()
 , l_states()
+, cond_profiles()
+, total_tests(0)
+, last_profile_update(0)
 {
     memset(&g, 0, sizeof(g));
     memset(&sn, 0, sizeof(sn));
@@ -282,13 +310,22 @@ QString SearchThreadEnv::init(int mc, bool large, const ConditionTree& condtree)
         flags |= LARGE_BIOMES;
     setupGenerator(&g, mc, flags);
 
+    // CRITICAL FIX: Re-initialize BiomeFilter in each copied Condition
+    // The BiomeFilter contains internal pointers that become invalid after copy
+    for (Condition& c : this->condtree.condvec)
+    {
+        QString err = c.apply(mc);
+        if (!err.isEmpty())
+            return err;
+    }
+
     QMap<uint64_t, QString> scripts;
     getScripts(scripts);
     for (auto& it : l_states)
         lua_close(it.second);
     l_states.clear();
 
-    for (const Condition& c: condtree.condvec)
+    for (const Condition& c: this->condtree.condvec)
     {
         if (c.type != F_LUA)
             continue;
@@ -365,9 +402,18 @@ int _testTreeAt(
     Pos                         at,             // relative origin
     SearchThreadEnv           * env,            // thread-local environment
     Pos                       * path,           // output center position(s)
-    int                         node
+    int                         node,
+    int                         depth = 0       // recursion depth tracking
 )
 {
+    // Prevent stack overflow from infinite recursion (circular references in condition tree)
+    if (depth > 200)
+    {
+        qCritical() << "ERROR: Recursion depth limit exceeded in _testTreeAt (depth=" << depth 
+                    << ", node=" << node << "). Possible circular reference in condition tree.";
+        return COND_FAILED;
+    }
+    
     const ConditionTree *tree = &env->condtree;
     const Condition& c = tree->condvec[node];
     const std::vector<char>& branches = tree->references[c.save];
@@ -441,7 +487,7 @@ int _testTreeAt(
                         int sta = COND_OK;
                         for (int b : branches)
                         {
-                            int stb = _testTreeAt(pos, env, path, b);
+                            int stb = _testTreeAt(pos, env, path, b, depth + 1);
                             if (*env->stop)
                                 return COND_FAILED;
                             if (stb < sta)
@@ -488,7 +534,7 @@ int _testTreeAt(
         st = COND_OK;
         for (int b : branches)
         {
-            int sta = _testTreeAt(pos, env, path, b);
+            int sta = _testTreeAt(pos, env, path, b, depth + 1);
             if (*env->stop)
                 return COND_FAILED;
             if (sta < st)
@@ -514,7 +560,7 @@ int _testTreeAt(
             st = COND_FAILED;
             for (int b : branches)
             {
-                int sta = _testTreeAt(at, env, path, b);
+                int sta = _testTreeAt(at, env, path, b, depth + 1);
                 if (*env->stop)
                     return COND_FAILED;
                 if (sta > st)
@@ -545,7 +591,7 @@ int _testTreeAt(
         st = COND_OK;
         for (int b : branches)
         {
-            int sta = _testTreeAt(at, env, path, b);
+            int sta = _testTreeAt(at, env, path, b, depth + 1);
             if (*env->stop)
                 return COND_FAILED;
             if      (sta == COND_OK) { st = COND_FAILED; break; }
@@ -561,7 +607,7 @@ int _testTreeAt(
             Pos *buf = path ? path : &inst[0];
             for (int b : branches)
             {
-                int sta = _testTreeAt(at, env, buf, b);
+                int sta = _testTreeAt(at, env, buf, b, depth + 1);
                 if (*env->stop)
                     return COND_FAILED;
                 if (sta < st) {
@@ -619,7 +665,7 @@ int _testTreeAt(
             {
                 if (st == COND_FAILED)
                     break;
-                int sta = _testTreeAt(pos, env, path, b);
+                int sta = _testTreeAt(pos, env, path, b, depth + 1);
                 if (*env->stop)
                     return COND_FAILED;
                 if (sta < st)
@@ -644,7 +690,7 @@ int _testTreeAt(
                 pos = inst[i];
                 for (int b : branches) // AND dependent conditions
                 {
-                    int stc = _testTreeAt(pos, env, path, b);
+                    int stc = _testTreeAt(pos, env, path, b, depth + 1);
                     if (*env->stop)
                         return COND_FAILED;
                     // worst branch dictates status for instance
@@ -672,6 +718,9 @@ int _testTreeAt(
     }
 }
 
+// Forward declaration for profiling helper
+static void updateProfilingStats(SearchThreadEnv *env);
+
 int testTreeAt(
     Pos                         at,             // relative origin
     SearchThreadEnv           * env,            // thread-local environment
@@ -679,6 +728,14 @@ int testTreeAt(
     Pos                       * path            // ok trigger positions
 )
 {
+    // Update profiling stats every 100k tests
+    env->total_tests++;
+    if (env->total_tests - env->last_profile_update >= 100000)
+    {
+        updateProfilingStats(env);
+        env->last_profile_update = env->total_tests;
+    }
+    
     if (pass != PASS_FAST_48)
     {   // do a fast check before continuing with slower checks
         env->searchpass = PASS_FAST_48;
@@ -1067,6 +1124,56 @@ static int f_noise_sampler(Generator *g, int scale, int x, int y, int z, void *d
 
 
 
+// Helper function to update profiling statistics every 100k tests
+static void updateProfilingStats(SearchThreadEnv *env)
+{
+    for (auto& it : env->cond_profiles)
+    {
+        auto& prof = it.second;
+        if (prof.samples.empty())
+            continue;
+        
+        // Calculate mean
+        int64_t sum = 0;
+        for (int64_t sample : prof.samples)
+            sum += sample;
+        prof.mean_ns = prof.samples.empty() ? 0 : sum / prof.samples.size();
+        
+        // Calculate median
+        std::vector<int64_t> sorted = prof.samples;
+        std::sort(sorted.begin(), sorted.end());
+        size_t mid = sorted.size() / 2;
+        prof.median_ns = sorted.empty() ? 0 : (sorted.size() % 2 == 0 ? 
+            (sorted[mid-1] + sorted[mid]) / 2 : sorted[mid]);
+        
+        // Calculate max
+        prof.max_ns = sorted.empty() ? 0 : sorted.back();
+        
+        // Clear samples for next batch
+        prof.samples.clear();
+    }
+}
+
+// RAII helper to profile condition timing
+struct ConditionProfiler {
+    SearchThreadEnv* env;
+    const Condition* cond;
+    std::chrono::high_resolution_clock::time_point start_time;
+    
+    ConditionProfiler(SearchThreadEnv* e, const Condition* c) 
+        : env(e), cond(c), start_time(std::chrono::high_resolution_clock::now()) {}
+    
+    ~ConditionProfiler() {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+        
+        // Record the timing sample
+        auto& prof = env->cond_profiles[cond->save];
+        prof.samples.push_back(duration);
+        prof.test_count++;
+    }
+};
+
 /* Tests if a condition is satisfied with 'at' as origin for a search pass.
  * If sufficiently satisfied (check return value) then:
  * when 'imax' is NULL, the center position is written to 'cent[0]'
@@ -1083,6 +1190,9 @@ testCondAt(
     const Condition           * cond            // condition to check
     )
 {
+    // Profile this condition's execution time
+    ConditionProfiler profiler(env, cond);
+    
     int x1, x2, z1, z2;
     int rx1, rx2, rz1, rz2, rx, rz;
     Pos pc;
@@ -1854,7 +1964,15 @@ L_qm_any:
         if (cond->count <= 0)
             return COND_FAILED;
 
-        s = 2; // use 1:4 scale for biome checking
+        switch (cond->step)
+        {
+        case 1:   s = 0; break;
+        case 4:   s = 2; break;
+        case 16:  s = 4; break;
+        case 64:  s = 6; break;
+        case 256: s = 8; break;
+        default:  s = 2; break; // default to 1:4 scale if not set
+        }
         rx1 = x1 >> s;
         rz1 = z1 >> s;
         rx2 = x2 >> s;
@@ -1930,7 +2048,6 @@ L_qm_any:
             return (uniqueCount >= cond->count) ? COND_OK : COND_FAILED;
         }
         return COND_FAILED;
-
 
     case F_BIOME_4_RIVER:
     case F_BIOME_256_OTEMP:
