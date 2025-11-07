@@ -113,6 +113,7 @@ private slots:
     void requestTask();
     void sendHeartbeat();
     void logSearchRate();
+    void checkTaskQueue(); // Check if we need more tasks
 
 private:
     void processMessage(const QByteArray& msg);
@@ -162,9 +163,9 @@ private:
     QTimer *m_rateLogTimer;
     QTimer *m_resultsFlushTimer;
     
-    // Progress tracking for logging
+    // Progress tracking for logging (use atomic to avoid race conditions)
     QElapsedTimer m_logTimer;
-    uint64_t m_logTotalSeeds;
+    std::atomic<uint64_t> m_logTotalSeeds; // Atomic to prevent race conditions from multiple threads
     uint64_t m_logLastSeeds; // Seeds count at last log
     bool m_logFirstInterval;
     
@@ -176,14 +177,20 @@ private:
     // Task counter for logging every Nth task
     std::atomic<uint64_t> m_taskCounter;
     static const int TASK_LOG_INTERVAL = 100; // Log every 100 tasks
-    static const qint64 PROGRESS_THROTTLE_MS = 100; // Send progress at most every 100ms
+    static const qint64 PROGRESS_THROTTLE_MS = 200; // Send progress at most every 200ms (reduced frequency)
     
     // Results batching to prevent signal queue buildup
     QMutex m_resultsBatchMutex;
     QVector<uint64_t> m_resultsBatch; // Accumulated results waiting to be sent
     QElapsedTimer m_resultsBatchTimer;
-    static const qint64 RESULTS_BATCH_MS = 25; // Send results at least every 25ms
-    static const int RESULTS_BATCH_SIZE = 10; // Or when batch reaches this size (reduced to prevent queue buildup)
+    static const qint64 RESULTS_BATCH_MS = 50; // Send results at least every 50ms (increased to reduce overhead)
+    static const int RESULTS_BATCH_SIZE = 50; // Or when batch reaches this size (increased to reduce network overhead)
+    
+    // Task queue management
+    QMutex m_taskRequestMutex;
+    bool m_taskRequestPending; // Track if we've already requested tasks
+    int m_inflightRequests; // Number of outstanding MSG_TASK_REQUEST not yet assigned
+    static const int TASK_QUEUE_LOW_THRESHOLD = 2; // Request more tasks when queue has <= this many tasks
 };
 
 #endif // SEARCHWORKERCLIENT_H

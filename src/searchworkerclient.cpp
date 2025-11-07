@@ -278,6 +278,7 @@ SearchWorkerClient::SearchWorkerClient(quint16 port, int threadCount, QObject *p
     , m_logFirstInterval(true)
     , m_progressThrottleAccumulator(0)
     , m_taskCounter(0)
+    , m_taskRequestPending(false)
 {
     m_resultsBatch.reserve(RESULTS_BATCH_SIZE);
     connect(m_server, &QTcpServer::newConnection, this, &SearchWorkerClient::onNewConnection);
@@ -728,7 +729,20 @@ void SearchWorkerClient::processMessage(const QByteArray& msg)
         // Start rate logging timer
         m_rateLogTimer->start();
         
-        requestTask();
+        // Request initial tasks to fill the queue to keep all threads busy
+        // Additional tasks will be requested automatically as queue gets low
+        int initialTasks = qMin(m_threadCount * 2, 64); // Warm start: 2x threads, capped at 64
+        for (int i = 0; i < initialTasks; i++)
+        {
+            QByteArray msg;
+            writeUint32(msg, MSG_TASK_REQUEST);
+            sendMessage(msg);
+            {
+                QMutexLocker locker(&m_taskRequestMutex);
+                m_taskRequestPending = true;
+                m_inflightRequests++;
+            }
+        }
         break;
     }
     
@@ -737,6 +751,14 @@ void SearchWorkerClient::processMessage(const QByteArray& msg)
         uint64_t sstart = readUint64(msg, offset);
         uint64_t scnt = readUint64(msg, offset);
         uint64_t idx = readUint64(msg, offset);
+        
+        // Mark that we've received a task, so we can request more if needed
+        {
+            QMutexLocker locker(&m_taskRequestMutex);
+            m_taskRequestPending = false;
+            if (m_inflightRequests > 0)
+                m_inflightRequests--;
+        }
         
         // Log only every Nth task
         uint64_t taskNum = m_taskCounter.fetch_add(1) + 1;
@@ -847,7 +869,7 @@ void SearchWorkerClient::startWorkerThreads()
                                                  m_searchtype, m_slist, &m_stop, this,
                                                  m_localGenCache);
         // Batch results to prevent Qt signal queue buildup
-        // Using BlockingQueuedConnection like standard SearchWorker to prevent unbounded queue growth
+        // Use QueuedConnection to avoid blocking worker threads - batching prevents queue growth
         connect(worker, &WorkerThread::taskResult, this, [this](uint64_t seed) {
             QMutexLocker locker(&m_resultsBatchMutex);
             m_resultsBatch.append(seed);
@@ -870,13 +892,6 @@ void SearchWorkerClient::startWorkerThreads()
             
             if (shouldSend && !m_resultsBatch.isEmpty())
             {
-                // DEBUG: Track batch size
-                static int maxBatchSeen = 0;
-                if (m_resultsBatch.size() > maxBatchSeen) {
-                    maxBatchSeen = m_resultsBatch.size();
-                    qDebug() << "DEBUG: Batch size:" << maxBatchSeen;
-                }
-                
                 QVector<uint64_t> toSend = m_resultsBatch;
                 m_resultsBatch.clear();
                 m_resultsBatchTimer.restart();
@@ -884,7 +899,7 @@ void SearchWorkerClient::startWorkerThreads()
                 
                 sendResults(toSend);
             }
-        }, Qt::BlockingQueuedConnection);  // Block to prevent unbounded queue growth
+        }, Qt::QueuedConnection);  // Non-blocking - batching prevents queue growth
         
         connect(worker, &WorkerThread::taskResults, this, [this](const QVector<uint64_t>& seeds) {
             // For batched results from worker, add to our batch buffer
@@ -901,51 +916,58 @@ void SearchWorkerClient::startWorkerThreads()
                 
                 sendResults(toSend);
             }
-        }, Qt::BlockingQueuedConnection);  // Block to prevent unbounded queue growth
+        }, Qt::QueuedConnection);  // Non-blocking - batching prevents queue growth
         
         connect(worker, &WorkerThread::taskProgress, this, [this](uint64_t prog, uint64_t seed) {
-            // Track total seeds for logging
-            m_logTotalSeeds += prog;
+            // Track total seeds for logging (atomic increment to avoid race conditions)
+            m_logTotalSeeds.fetch_add(prog, std::memory_order_relaxed);
             
             // Throttle progress updates to prevent signal queue buildup
-            // Multiple threads may call this, so use mutex protection
-            QMutexLocker locker(&m_progressThrottleMutex);
+            // Use atomic operations to reduce mutex contention
+            uint64_t accumulated;
+            bool shouldSend = false;
             
-            m_progressThrottleAccumulator += prog;
-            
-            qint64 elapsed = m_progressThrottleTimer.elapsed();
-            if (elapsed >= PROGRESS_THROTTLE_MS || !m_progressThrottleTimer.isValid())
             {
-                // Send accumulated progress
-                if (!m_progressThrottleTimer.isValid())
+                QMutexLocker locker(&m_progressThrottleMutex);
+                m_progressThrottleAccumulator += prog;
+                
+                qint64 elapsed = m_progressThrottleTimer.elapsed();
+                if (elapsed >= PROGRESS_THROTTLE_MS || !m_progressThrottleTimer.isValid())
                 {
-                    m_progressThrottleTimer.start();
+                    // Send accumulated progress
+                    if (!m_progressThrottleTimer.isValid())
+                    {
+                        m_progressThrottleTimer.start();
+                    }
+                    
+                    accumulated = m_progressThrottleAccumulator;
+                    m_progressThrottleAccumulator = 0;
+                    m_progressThrottleTimer.restart();
+                    shouldSend = true;
                 }
-                
-                uint64_t toSend = m_progressThrottleAccumulator;
-                m_progressThrottleAccumulator = 0;
-                m_progressThrottleTimer.restart();
-                
-                // Unlock before sending to avoid blocking other threads
-                locker.unlock();
-                
+            }
+            
+            // Send outside mutex to avoid blocking other threads
+            if (shouldSend)
+            {
                 QByteArray progress;
                 writeUint32(progress, MSG_PROGRESS);
-                writeUint64(progress, toSend);
+                writeUint64(progress, accumulated);
                 writeUint64(progress, seed);
                 sendMessage(progress);
             }
-        }, Qt::BlockingQueuedConnection);  // Block to prevent unbounded queue growth
+        }, Qt::QueuedConnection);  // Non-blocking - throttling prevents queue growth
         
         connect(worker, &WorkerThread::taskFinished, this, [this]() {
-            // Task completed, send done message and request next task
+            // Task completed, send done message
             // Note: Multiple threads may emit this, but that's okay - each completed task needs a done message
             // Logging is done in MSG_TASK_ASSIGN handler (every Nth task)
             QByteArray done;
             writeUint32(done, MSG_DONE);
             sendMessage(done);
-            requestTask();
-        }, Qt::BlockingQueuedConnection);  // Block to prevent unbounded queue growth
+            // Check if we need more tasks (batched to reduce network overhead)
+            QMetaObject::invokeMethod(this, "checkTaskQueue", Qt::QueuedConnection);
+        }, Qt::QueuedConnection);  // Non-blocking - task requests are queued
         
         m_workers.push_back(worker);
         worker->start();
@@ -1225,9 +1247,9 @@ void WorkerThread::run()
                                     results.append(low);
                             }
                             curIdx += slice.size();
-                            if (slice.size() >= remaining)
+                            if (static_cast<uint64_t>(slice.size()) >= remaining)
                                 break;
-                            remaining -= slice.size();
+                            remaining -= static_cast<uint64_t>(slice.size());
                         }
                     }
                     else
@@ -1408,9 +1430,9 @@ void WorkerThread::run()
                                 }
                             }
                             flat += lows.size();
-                            if (lows.size() >= remaining)
+                            if (static_cast<uint64_t>(lows.size()) >= remaining)
                                 break;
-                            remaining -= lows.size();
+                            remaining -= static_cast<uint64_t>(lows.size());
                         }
                     }
                     else
@@ -1629,7 +1651,9 @@ void WorkerThread::run()
         
         // Send progress (aggregated per task to reduce signal frequency)
         // Note: Progress is already tracked per-task, so we send it once per task completion
-        emit taskProgress(testedCount ? testedCount : scnt, sstart + (testedCount ? testedCount : scnt));
+        // Use testedCount (actual seeds tested) for accurate progress reporting
+        uint64_t actualProgress = testedCount ? testedCount : scnt;
+        emit taskProgress(actualProgress, sstart + actualProgress);
         
         // Notify task completion
         emit taskFinished();
@@ -1744,6 +1768,42 @@ void SearchWorkerClient::requestTask()
     QByteArray msg;
     writeUint32(msg, MSG_TASK_REQUEST);
     sendMessage(msg);
+    
+    // Mark that we've requested a task
+    QMutexLocker locker(&m_taskRequestMutex);
+    m_taskRequestPending = true;
+    m_inflightRequests++;
+}
+
+void SearchWorkerClient::checkTaskQueue()
+{
+    if (!isConnected() || !m_configReceived || m_stop)
+        return;
+    
+    // Determine how many tasks we should have queued to keep threads busy
+    int desiredQueued = qMax(m_threadCount, 4);
+    
+    // Current queue depth and in-flight requests
+    int queueSize;
+    {
+        QMutexLocker taskLocker(&m_taskMutex);
+        queueSize = static_cast<int>(m_taskQueue.size());
+    }
+    int inflight;
+    {
+        QMutexLocker requestLocker(&m_taskRequestMutex);
+        inflight = m_inflightRequests;
+    }
+    
+    int need = desiredQueued - (queueSize + inflight);
+    if (need <= 0)
+        return;
+    
+    // Request up to 'need' tasks to top up the queue
+    for (int i = 0; i < need; i++)
+    {
+        requestTask();
+    }
 }
 
 void SearchWorkerClient::sendHeartbeat()
@@ -1761,29 +1821,32 @@ void SearchWorkerClient::logSearchRate()
     if (!m_configReceived || m_stop)
         return;
     
-    // Calculate rate over the last 10 seconds (since last log or start)
+    // Calculate rate over the actual elapsed time (similar to coordinator's 20-second window approach)
     qint64 elapsedMs = m_logTimer.elapsed();
     if (elapsedMs <= 0)
         return;
     
-    uint64_t seedsDelta = m_logTotalSeeds - m_logLastSeeds;
+    uint64_t currentTotal = m_logTotalSeeds.load(std::memory_order_relaxed);
+    uint64_t seedsDelta = currentTotal - m_logLastSeeds;
     double elapsedSec = elapsedMs / 1000.0;
     
-    // For the first log, use actual elapsed time; for subsequent logs, use 10-second interval
+    // Always use actual elapsed time for accurate rate calculation
+    // Match coordinator's approach of using actual time windows rather than fixed intervals
     if (m_logFirstInterval)
     {
         m_logFirstInterval = false;
         // Use actual elapsed time for first log
+        if (elapsedSec < 1.0)
+            return; // Wait at least 1 second before first log for accuracy
     }
     else
     {
-        // For subsequent logs, calculate rate over the last 10-second interval
-        elapsedSec = 10.0; // Fixed 10-second interval
-        // Reset timer for next interval (but don't reset total seeds)
+        // For subsequent logs, use actual elapsed time since last log
+        // Restart timer after reading to prepare for next interval
         m_logTimer.restart();
     }
     
-    m_logLastSeeds = m_logTotalSeeds;
+    m_logLastSeeds = currentTotal;
     
     if (elapsedSec <= 0.0)
         return;
