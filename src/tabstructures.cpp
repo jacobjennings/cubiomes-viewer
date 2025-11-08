@@ -3,14 +3,18 @@
 
 #include "message.h"
 #include "util.h"
+#include "search.h"
 
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QTextStream>
 #include <QTreeWidgetItem>
+#include <QSignalBlocker>
 
 #include <map>
 #include <set>
+#include <vector>
+#include <algorithm>
 
 
 enum { C_SEED, C_STRUCT, C_COUNT, C_X, C_Z, C_DETAIL }; // columns
@@ -35,18 +39,87 @@ void AnalysisStructures::run()
     Generator g;
     setupGenerator(&g, wi.mc, wi.large);
 
+    condtree.condvec.clear();
+    condtree.references.clear();
+
+    SearchThreadEnv centerEnv;
+    const Condition *centerCond = nullptr;
+    bool centerEnabled = false;
+
+    if (centerOnCondSave > 0 && !centerConds.empty())
+    {
+        QString err = condtree.set(centerConds, wi.mc);
+        if (err.isEmpty())
+        {
+            err = centerEnv.init(wi.mc, wi.large, condtree);
+            if (err.isEmpty())
+            {
+                for (const Condition& c : condtree.condvec)
+                {
+                    if (c.save == centerOnCondSave && !(c.meta & Condition::DISABLED))
+                    {
+                        centerCond = &c;
+                        break;
+                    }
+                }
+                if (centerCond)
+                {
+                    centerEnabled = true;
+                    centerEnv.stop = &stop;
+                }
+            }
+        }
+    }
+
     for (idx = 0; idx < (long)seeds.size(); idx++)
     {
-        if (stop) break;
+        if (stop)
+            break;
         wi.seed = seeds[idx];
+
+        Dat currentArea = area;
+
+        if (centerEnabled)
+        {
+            centerEnv.setSeed(wi.seed);
+
+            size_t pathSize = 1;
+            for (const Condition& c : condtree.condvec)
+                pathSize = std::max(pathSize, static_cast<size_t>(c.save) + 1);
+            std::vector<Pos> path(pathSize);
+            for (Pos& p : path)
+            {
+                p.x = -1;
+                p.z = -1;
+            }
+
+            Pos origin = {0, 0};
+            int result = testTreeAt(origin, &centerEnv, PASS_FULL_64, path.data());
+
+            if (result == COND_OK &&
+                centerCond->save < static_cast<int>(path.size()) &&
+                path[centerCond->save].x != -1 && path[centerCond->save].z != -1)
+            {
+                Pos structPos = path[centerCond->save];
+                currentArea.x1 += structPos.x;
+                currentArea.x2 += structPos.x;
+                currentArea.z1 += structPos.z;
+                currentArea.z2 += structPos.z;
+            }
+            else
+            {
+                continue;
+            }
+        }
+
         if (quad)
-            runQuads(&g);
+            runQuads(&g, currentArea);
         else
-            runStructs(&g);
+            runStructs(&g, currentArea);
     }
 }
 
-void AnalysisStructures::runStructs(Generator *g)
+void AnalysisStructures::runStructs(Generator *g, const Dat& area)
 {
     QTreeWidgetItem *seeditem = new TreeIntItem();
     seeditem->setText(0, QString::asprintf("%" PRId64, wi.seed));
@@ -172,8 +245,9 @@ void AnalysisStructures::runStructs(Generator *g)
     emit itemDone(seeditem);
 }
 
-void AnalysisStructures::runQuads(Generator *g)
+void AnalysisStructures::runQuads(Generator *g, const Dat& area)
 {
+    Q_UNUSED(area);
     applySeed(g, 0, wi.seed);
 
     QVector<QuadInfo> qsinfo;
@@ -225,6 +299,7 @@ TabStructures::TabStructures(MainWindow *parent)
     , sortcolq(-1)
     , nextupdate()
     , updt(100)
+    , centerOnConditionSave(0)
 {
     ui->setupUi(this);
 
@@ -241,6 +316,14 @@ TabStructures::TabStructures(MainWindow *parent)
 
     connect(ui->treeStructs, &QTreeWidget::itemClicked, this, &TabStructures::onTreeItemClicked);
     connect(ui->treeQuads, &QTreeWidget::itemClicked, this, &TabStructures::onTreeItemClicked);
+
+    ui->comboCenterOn->addItem(tr("None"), 0);
+    connect(ui->comboCenterOn, SIGNAL(currentIndexChanged(int)),
+            this, SLOT(on_comboCenterOn_currentIndexChanged(int)));
+    updateCenterOnFilterList();
+
+    connect(parent->formCond, &FormConditions::changed,
+            this, &TabStructures::updateCenterOnFilterList);
 }
 
 TabStructures::~TabStructures()
@@ -281,6 +364,7 @@ void TabStructures::save(QSettings& settings)
     settings.setValue("analysis/seedsrc", ui->comboSeedSource->currentIndex());
     settings.setValue("analysis/maponly", ui->radioMap->isChecked());
     settings.setValue("analysis/collect", ui->checkCollect->isChecked());
+    settings.setValue("analysis/structCenterOnCondSave", centerOnConditionSave);
 }
 
 static void loadCheck(QSettings *s, QCheckBox *cb, const char *key)
@@ -308,6 +392,8 @@ void TabStructures::load(QSettings& settings)
         ui->radioMap->setChecked(true);
     else
         ui->radioAll->setChecked(true);
+    centerOnConditionSave = settings.value("analysis/structCenterOnCondSave", 0).toInt();
+    updateCenterOnFilterList();
 }
 
 void TabStructures::onHeaderClick(QTreeView *tree)
@@ -441,6 +527,11 @@ void TabStructures::on_pushStart_clicked()
     thread.area = AnalysisStructures::Dat{x1, z1, x2, z2};
 
     thread.collect = ui->checkCollect->isChecked();
+    thread.centerOnCondSave = centerOnConditionSave;
+    if (centerOnConditionSave > 0)
+        thread.centerConds = parent->formCond->getConditions();
+    else
+        thread.centerConds.clear();
 
     if (ui->radioMap->isChecked())
     {
@@ -537,7 +628,7 @@ void TabStructures::exportResults(QTextStream& stream)
             std::set<QString> structures;
             std::map<uint64_t, std::map<QString, QString>> cnt; // [seed][stype]
 
-            uint64_t seed;
+            uint64_t seed = 0;
             QString structure;
             for (QTreeWidgetItemIterator it(ui->treeStructs); *it; ++it)
             {
@@ -648,4 +739,46 @@ void TabStructures::on_tabWidget_currentChanged(int)
             ok = ui->treeQuads->topLevelItemCount() > 0;
     }
     ui->pushExport->setEnabled(ok);
+}
+
+void TabStructures::on_comboCenterOn_currentIndexChanged(int index)
+{
+    centerOnConditionSave = ui->comboCenterOn->itemData(index).toInt();
+}
+
+void TabStructures::updateCenterOnFilterList()
+{
+    if (!ui || !parent || !parent->formCond)
+        return;
+
+    int currentSave = centerOnConditionSave;
+
+    QSignalBlocker blocker(ui->comboCenterOn);
+    ui->comboCenterOn->clear();
+    ui->comboCenterOn->addItem(tr("None"), 0);
+
+    const std::vector<Condition>& conds = parent->formCond->getConditions();
+    for (const Condition& c : conds)
+    {
+        if (c.meta & Condition::DISABLED)
+            continue;
+
+        const FilterInfo& ft = g_filterinfo.list[c.type];
+        if (ft.stype > 0 || c.type == F_QH_IDEAL || c.type == F_QH_CLASSIC ||
+            c.type == F_QH_NORMAL || c.type == F_QH_BARELY ||
+            c.type == F_QM_90 || c.type == F_QM_95)
+        {
+            QString summary = c.summary(false);
+            ui->comboCenterOn->addItem(summary, c.save);
+        }
+    }
+
+    int idx = ui->comboCenterOn->findData(currentSave);
+    if (idx >= 0)
+        ui->comboCenterOn->setCurrentIndex(idx);
+    else
+    {
+        centerOnConditionSave = 0;
+        ui->comboCenterOn->setCurrentIndex(0);
+    }
 }

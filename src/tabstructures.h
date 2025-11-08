@@ -11,12 +11,14 @@ class AnalysisStructures : public QThread
 {
     Q_OBJECT
 public:
+    struct Dat { int x1, z1, x2, z2; };
+
     explicit AnalysisStructures(QObject *parent = nullptr)
         : QThread(parent),idx() {}
 
     virtual void run() override;
-    void runStructs(Generator *g);
-    void runQuads(Generator *g);
+    void runStructs(Generator *g, const Dat& area);
+    void runQuads(Generator *g, const Dat& area);
 
 signals:
     void itemDone(QTreeWidgetItem *item);
@@ -28,10 +30,13 @@ public:
     int dim;
     std::atomic_bool stop;
     std::atomic_int idx;
-    struct Dat { int x1, z1, x2, z2; } area;
+    Dat area;
     bool mapshow[D_STRUCT_NUM];
     bool collect;
     bool quad;
+    int centerOnCondSave;
+    std::vector<Condition> centerConds;
+    ConditionTree condtree;
 };
 
 class TabStructures : public QWidget, public ISaveTab
@@ -61,6 +66,10 @@ private slots:
     void on_pushExport_clicked();
     void on_buttonFromVisible_clicked();
     void on_tabWidget_currentChanged(int index);
+    void on_comboCenterOn_currentIndexChanged(int index);
+
+public slots:
+    void updateCenterOnFilterList();
 
 private:
     void exportResults(QTextStream& stream);
@@ -77,6 +86,7 @@ private:
     uint64_t updt;
     QList<QTreeWidgetItem*> qbufs;
     QList<QTreeWidgetItem*> qbufq;
+    int centerOnConditionSave;
 };
 
 #endif // TABSTRUCTURES_H
