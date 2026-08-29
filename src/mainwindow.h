@@ -7,6 +7,7 @@
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QMutex>
+#include <QProcess>
 #include <QRunnable>
 #include <QSettings>
 #include <QTableWidgetItem>
@@ -16,6 +17,7 @@
 #include <QTreeWidgetItem>
 #include <QVector>
 #include <QWidget>
+#include <QUrl>
 
 #include <atomic>
 
@@ -55,6 +57,7 @@ public:
     bool setSeed(WorldInfo wi, int dim = DIM_UNDEF);
     int getDim();
     MapView *getMapView();
+    QUrl terrainViewerUrl();
 
 protected:
     void saveSettings();
@@ -151,6 +154,7 @@ public:
     QAction *actzoom[2];
     QAction *dimactions[3];
     QActionGroup *dimgroup;
+    QProcess *terrainService;
 };
 
 #endif // MAINWINDOW_H

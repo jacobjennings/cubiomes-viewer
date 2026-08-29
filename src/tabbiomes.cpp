@@ -1571,7 +1571,12 @@ void TabBiomes::openFindsInBrowser(bool favoritesOnly)
     QString version = mc2str(model->cmp.mc);
     int dim = parent->getDim();
     QString dimension = dim < 0 ? "nether" : dim > 0 ? "end" : "overworld";
-    QUrl url("https://jacobjennings.github.io/cubiomes-finds-viewer/");
+    QUrl url = parent->terrainViewerUrl();
+    if (!url.isValid() || url.isEmpty())
+    {
+        warn(parent, tr("The SteelMC terrain service is not installed or could not be started."));
+        return;
+    }
     QUrlQuery query;
     query.addQueryItem("seed", QString::number((qint64)firstSeed));
     query.addQueryItem("x", QString::number(firstCenter.x()));

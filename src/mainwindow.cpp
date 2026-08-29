@@ -35,6 +35,7 @@
 #include <QMetaType>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QDir>
 #include <QTreeWidget>
 #include <QTranslator>
 
@@ -63,6 +64,7 @@ MainWindow::MainWindow(QString sessionpath, QString resultspath, QWidget *parent
     , progval(-1)
     , dimactions{}
     , dimgroup()
+    , terrainService(nullptr)
 {
     QSettings settings(APP_STRING, APP_STRING);
     QString lang = settings.value("config/lang", QLocale().name()).toString();
@@ -304,6 +306,12 @@ MainWindow::MainWindow(QString sessionpath, QString resultspath, QWidget *parent
 
 MainWindow::~MainWindow()
 {
+    if (terrainService && terrainService->state() != QProcess::NotRunning)
+    {
+        terrainService->terminate();
+        if (!terrainService->waitForFinished(3000))
+            terrainService->kill();
+    }
     delete ui;
 }
 
@@ -312,7 +320,47 @@ void MainWindow::closeEvent(QCloseEvent *event)
     formControl->stopSearch();
     QThreadPool::globalInstance()->clear();
     saveSettings();
+    if (terrainService && terrainService->state() != QProcess::NotRunning)
+    {
+        terrainService->terminate();
+        if (!terrainService->waitForFinished(3000))
+            terrainService->kill();
+    }
     QMainWindow::closeEvent(event);
+}
+
+QUrl MainWindow::terrainViewerUrl()
+{
+    QByteArray configured = qgetenv("CUBIOMES_TERRAIN_VIEWER_URL");
+    if (!configured.isEmpty())
+        return QUrl(QString::fromUtf8(configured));
+
+    const QUrl localUrl("http://127.0.0.1:8123/");
+    if (terrainService && terrainService->state() != QProcess::NotRunning)
+        return localUrl;
+
+    QString executable = QString::fromUtf8(qgetenv("CUBIOMES_WORLDGEN_SERVICE"));
+    if (executable.isEmpty())
+        executable = QStandardPaths::findExecutable("cubiomes-worldgen-service");
+    if (executable.isEmpty())
+        return QUrl();
+
+    QString viewer = QString::fromUtf8(qgetenv("CUBIOMES_TERRAIN_VIEWER_DIR"));
+    if (viewer.isEmpty())
+        viewer = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
+                .filePath("cubiomes-finds-viewer");
+
+    terrainService = new QProcess(this);
+    terrainService->setProcessChannelMode(QProcess::ForwardedErrorChannel);
+    terrainService->start(executable,
+            QStringList() << "--http" << "127.0.0.1:8123" << "--static" << viewer);
+    if (!terrainService->waitForStarted(3000))
+    {
+        terrainService->deleteLater();
+        terrainService = nullptr;
+        return QUrl();
+    }
+    return localUrl;
 }
 
 bool MainWindow::loadTranslation(QString lang)
