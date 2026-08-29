@@ -214,6 +214,8 @@ private slots:
     void on_pushStart_clicked();
     void on_pushExport_clicked();
     void on_pushFavorites_clicked();
+    void on_pushViewFavorites_clicked();
+    void on_pushViewAll_clicked();
     void on_buttonFromVisible_clicked();
     void on_radioFullSample_toggled(bool checked);
     void on_lineBiomeSize_textChanged(const QString &arg1);
@@ -229,6 +231,7 @@ private:
     void toggleCurrentLiked();
     void copyCurrentSeed();
     QByteArray favoriteSeedList(bool withCenters) const;
+    void openFindsInBrowser(bool favoritesOnly);
 
 private:
     Ui::TabBiomes *ui;

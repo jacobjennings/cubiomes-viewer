@@ -11,6 +11,7 @@
 #include <QClipboard>
 #include <QCryptographicHash>
 #include <QDataStream>
+#include <QDesktopServices>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QRegularExpressionValidator>
@@ -19,6 +20,8 @@
 #include <QShortcut>
 #include <QTextStream>
 #include <QTimer>
+#include <QUrl>
+#include <QUrlQuery>
 #include <QtEndian>
 
 #include <random>
@@ -941,6 +944,8 @@ bool TabBiomes::restoreStatistics(const QString& encoded, const std::vector<uint
     statisticsInvalidated = false;
     ui->pushExport->setEnabled(!seeds.isEmpty());
     ui->pushFavorites->setEnabled(!seeds.isEmpty());
+    ui->pushViewFavorites->setEnabled(!seeds.isEmpty());
+    ui->pushViewAll->setEnabled(!seeds.isEmpty());
     ui->table->resizeColumnsToContents();
     on_tabWidget_currentChanged(-1);
     return true;
@@ -978,6 +983,8 @@ void TabBiomes::clearStatistics()
     model->reset(wi.mc);
     ui->pushExport->setEnabled(false);
     ui->pushFavorites->setEnabled(false);
+    ui->pushViewFavorites->setEnabled(false);
+    ui->pushViewAll->setEnabled(false);
 }
 
 void TabBiomes::onSearchResultsChanged()
@@ -1326,6 +1333,8 @@ void TabBiomes::on_pushStart_clicked()
 
     ui->pushExport->setEnabled(false);
     ui->pushFavorites->setEnabled(false);
+    ui->pushViewFavorites->setEnabled(false);
+    ui->pushViewAll->setEnabled(false);
     ui->pushStart->setChecked(true);
     QString progress = QString::asprintf(" (0/%zu)", thread->seeds.size());
     ui->pushStart->setText(tr("Stop") + progress);
@@ -1522,6 +1531,60 @@ void TabBiomes::on_pushFavorites_clicked()
 #endif
 }
 
+void TabBiomes::on_pushViewFavorites_clicked()
+{
+    openFindsInBrowser(true);
+}
+
+void TabBiomes::on_pushViewAll_clicked()
+{
+    openFindsInBrowser(false);
+}
+
+void TabBiomes::openFindsInBrowser(bool favoritesOnly)
+{
+    QByteArray records("v1\n");
+    uint64_t firstSeed = 0;
+    QPoint firstCenter;
+    int included = 0;
+    for (int row = 0, count = proxy->rowCount(); row < count; row++)
+    {
+        uint64_t seed = proxy->headerData(row, Qt::Vertical, Qt::UserRole).toULongLong();
+        bool liked = model->isLiked(seed);
+        if (favoritesOnly && !liked)
+            continue;
+        QPoint center = centers.value(seed);
+        records += QString("%1,%2,%3,%4\n")
+                .arg((qint64)seed).arg(center.x()).arg(center.y()).arg(liked ? 1 : 0).toUtf8();
+        if (included++ == 0)
+        {
+            firstSeed = seed;
+            firstCenter = center;
+        }
+    }
+    if (included == 0)
+    {
+        warn(parent, favoritesOnly ? tr("No favorite seeds are checked.") : tr("There are no biome statistics to view."));
+        return;
+    }
+
+    QString version = mc2str(model->cmp.mc);
+    int dim = parent->getDim();
+    QString dimension = dim < 0 ? "nether" : dim > 0 ? "end" : "overworld";
+    QUrl url("https://jacobjennings.github.io/cubiomes-finds-viewer/");
+    QUrlQuery query;
+    query.addQueryItem("seed", QString::number((qint64)firstSeed));
+    query.addQueryItem("x", QString::number(firstCenter.x()));
+    query.addQueryItem("z", QString::number(firstCenter.y()));
+    query.addQueryItem("version", version);
+    query.addQueryItem("dimension", dimension);
+    url.setQuery(query);
+    QByteArray payload = records.toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+    url.setFragment("finds=" + QString::fromLatin1(payload));
+    if (!QDesktopServices::openUrl(url))
+        warn(parent, tr("Could not open the 3D finds viewer in a browser."));
+}
+
 void TabBiomes::on_buttonFromVisible_clicked()
 {
     MapView *mapview = parent->getMapView();
@@ -1583,6 +1646,8 @@ void TabBiomes::on_tabWidget_currentChanged(int)
     ui->pushExport->setEnabled(ok);
     bool stats = ui->tabWidget->currentWidget() == ui->tabStats;
     ui->pushFavorites->setEnabled(stats && !model->seeds.isEmpty());
+    ui->pushViewFavorites->setEnabled(stats && !model->seeds.isEmpty());
+    ui->pushViewAll->setEnabled(stats && !model->seeds.isEmpty());
 }
 
 void TabBiomes::on_comboCenterOn_currentIndexChanged(int index)

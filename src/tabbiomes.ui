@@ -46,6 +46,32 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="pushViewFavorites">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="toolTip">
+        <string>Open checked seeds and their Center coordinates in the 3D browser viewer</string>
+       </property>
+       <property name="text">
+        <string>View liked</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushViewAll">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="toolTip">
+        <string>Open all analyzed seeds and their Center coordinates in the 3D browser viewer</string>
+       </property>
+       <property name="text">
+        <string>View all</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QPushButton" name="pushStart">
        <property name="text">
         <string>Analyze</string>
