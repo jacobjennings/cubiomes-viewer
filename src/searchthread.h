@@ -27,7 +27,8 @@ struct Session
     Gen48Config gen48;
     std::vector<Condition> cv;
     std::vector<uint64_t> slist;
-    int centerOnBiomesConditionSave;
+    int centerOnBiomesConditionSave = 0;
+    QString biomeStatistics;
 };
 
 struct SearchWorker;
@@ -61,6 +62,7 @@ public:
 
     // Get aggregated profiling data from local workers
     void getProfilingData(std::vector<Condition>& conditions);
+    void captureConditionStats();
 
     bool requestItem(SearchWorker *item);
 
@@ -88,6 +90,7 @@ public:
     uint64_t                    count;
 
     SearchThreadEnv             env;
+    std::map<int, std::pair<uint64_t, uint64_t>> finished_condition_stats;
 
     int                         searchtype;
     int                         mc;

@@ -43,6 +43,9 @@
      <property name="contextMenuPolicy">
       <enum>Qt::CustomContextMenu</enum>
      </property>
+     <property name="toolTip">
+      <string>After a search, each condition shows the percentage of seeds it rejected, with the rejected and checked counts. The number in brackets is the condition ID, not its row number. Dependent rows are checked only after their parent passes.</string>
+     </property>
      <property name="dragDropMode">
       <enum>QAbstractItemView::InternalMove</enum>
      </property>
@@ -71,9 +74,12 @@
       </widget>
      </item>
      <item>
-      <widget class="QPushButton" name="buttonDisable">
+     <widget class="QPushButton" name="buttonDisable">
        <property name="text">
-        <string>Dis-/Enable</string>
+        <string>Enable / disable</string>
+       </property>
+       <property name="toolTip">
+        <string>Toggle whether the selected condition(s) participate in the search. Disabled conditions are shown with # symbols.</string>
        </property>
       </widget>
      </item>

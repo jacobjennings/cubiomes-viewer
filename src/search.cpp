@@ -16,9 +16,19 @@
 #include <QThread>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <deque>
 #include <functional>
 
 #define MULTIPLY_CHAR QChar(0xD7)
+
+static bool isWaterBiomeType(int id)
+{
+    return isOceanic(id) || id == river || id == frozen_river;
+}
 
 QString Condition::summary(bool aligntab) const
 {
@@ -74,9 +84,11 @@ QString Condition::summary(bool aligntab) const
     else
         s += "     ";
 
+    if (getRadiusMin() > 0)
+        s += QString::asprintf("r>=%d", getRadiusMin());
     if (rmax > 0)
     {
-        s += QString::asprintf("r<%d", rmax-1);
+        s += QString::asprintf("r<=%d", rmax-1);
     }
     else
     {
@@ -85,7 +97,19 @@ QString Condition::summary(bool aligntab) const
         if (ft.loc & FilterInfo::LOC_2)
             s += QString::asprintf(",(%d,%d)", x2, z2);
     }
-    
+
+    if (type == F_WATER && converage > 0)
+        s += QString::asprintf(" water>=%.2f%%", converage * 100.0);
+    if (type == F_OCEAN_CORRIDOR)
+    {
+        s += QString::asprintf(" near<=%d span>=%d shore>=%d",
+                getCorridorNear(), getCorridorSpan(), getCorridorTouchCount());
+        if (std::isfinite(converage) && converage > 1)
+            s += QString::asprintf(" width<=%.0f", converage);
+        if (flags & FLG_CORRIDOR_ALL_CLIMATES)
+            s += " all-ocean-climates";
+    }
+
     // Add profiling information if available
     if (prof_mean_ns > 0 || prof_median_ns > 0 || prof_max_ns > 0)
     {
@@ -94,6 +118,17 @@ QString Condition::summary(bool aligntab) const
         double median_us = prof_median_ns / 1000.0;
         double max_us = prof_max_ns / 1000.0;
         s += QString::asprintf(" [μ:%.1f/%.1f/%.1f]", mean_us, median_us, max_us);
+    }
+
+    if (prof_eval_count > 0)
+    {
+        // Use conservative rounding so a near-100% result does not look like
+        // it rejected every candidate.
+        double dropped = 100.0 * prof_fail_count / prof_eval_count;
+        dropped = std::floor(dropped * 10.0) / 10.0;
+        s += QString::asprintf(" [dropped %.1f%% (%llu of %llu)]", dropped,
+                (unsigned long long)prof_fail_count,
+                (unsigned long long)prof_eval_count);
     }
     
     return s;
@@ -186,6 +221,24 @@ bool Condition::versionUpgrade()
 QString Condition::apply(int mc)
 {
     int in[256] = {}, inlen = 0, ex[256] = {}, exlen = 0;
+
+    if (type == F_WATER)
+    {
+        // Water coverage always means every ocean and river biome. This also
+        // keeps sessions with an empty or stale biome mask self-contained.
+        biomeToFind = biomeToFindM = 0;
+        biomeToExcl = biomeToExclM = 0;
+        for (int id = 0; id < 256; id++)
+        {
+            if (!isWaterBiomeType(id))
+                continue;
+            if (id < 128)
+                biomeToFind |= 1ULL << id;
+            else
+                biomeToFindM |= 1ULL << (id - 128);
+        }
+    }
+
     for (int i = 0; i < 64; i++)
     {
         if (biomeToFind & (1ULL << i))
@@ -209,6 +262,8 @@ QString Condition::apply(int mc)
     prof_mean_ns = 0;
     prof_median_ns = 0;
     prof_max_ns = 0;
+    prof_eval_count = 0;
+    prof_fail_count = 0;
     
     return "";
 }
@@ -284,6 +339,12 @@ SearchThreadEnv::SearchThreadEnv()
 , stop()
 , l_states()
 , cond_profiles()
+, branch_order_profiles()
+, branch_probe_tests()
+, adaptive_order_enabled(true)
+, profile_mutex()
+, condition_stats_events()
+, collect_condition_stats(false)
 , total_tests(0)
 , last_profile_update(0)
 {
@@ -305,6 +366,16 @@ QString SearchThreadEnv::init(int mc, bool large, const ConditionTree& condtree)
     this->seed = 0;
     this->surfdim = DIM_UNDEF;
     this->octaves = 0;
+    this->cond_profiles.clear();
+    this->branch_order_profiles.assign(
+        this->condtree.condvec.size(), BranchOrderProfile());
+    this->branch_probe_tests.assign(this->condtree.condvec.size(), 0);
+    this->adaptive_order_enabled =
+        std::getenv("CUBIOMES_DISABLE_AUTO_ORDER") == nullptr;
+    this->condition_stats_events.clear();
+    this->collect_condition_stats = false;
+    this->total_tests = 0;
+    this->last_profile_update = 0;
     uint32_t flags = 0;
     if (large)
         flags |= LARGE_BIOMES;
@@ -397,13 +468,128 @@ static Pos* getPosBuf(uint32_t node)
     return &buf[node * MAX_INSTANCES];
 }
 
+static int _testTreeAt(
+    Pos                         at,
+    SearchThreadEnv           * env,
+    Pos                       * path,
+    int                         node,
+    int                         depth);
+
+static int testTreeBranch(
+    Pos                         at,
+    SearchThreadEnv           * env,
+    Pos                       * path,
+    int                         node,
+    int                         depth)
+{
+    bool measure = false;
+    std::chrono::steady_clock::time_point started;
+    if (env->adaptive_order_enabled && env->searchpass == PASS_FULL_64 &&
+        node >= 0 && node < (int)env->branch_order_profiles.size())
+    {
+        const auto& profile = env->branch_order_profiles[node];
+        // Measure initial calls densely, then sample occasionally. Rejection
+        // counts remain exact while clock reads stay out of almost all calls.
+        measure = profile.timed_count < 32 || (profile.eval_count & 255) == 0;
+        if (measure)
+            started = std::chrono::steady_clock::now();
+    }
+    int status = _testTreeAt(at, env, path, node, depth);
+    if (env->adaptive_order_enabled && env->searchpass == PASS_FULL_64 &&
+        node >= 0 && node < (int)env->branch_order_profiles.size())
+    {
+        auto& profile = env->branch_order_profiles[node];
+        profile.eval_count++;
+        if (status == COND_FAILED)
+            profile.fail_count++;
+        if (measure)
+        {
+            profile.total_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            profile.timed_count++;
+        }
+    }
+    return status;
+}
+
+static bool trainAllSiblingConditions(
+        SearchThreadEnv *env,
+        int parent,
+        const std::vector<char>& branches)
+{
+    if (!env->adaptive_order_enabled || env->searchpass != PASS_FULL_64 ||
+        branches.size() < 2)
+        return false;
+    // Refresh every sibling's measurements occasionally so a condition that
+    // moved later cannot be permanently starved by an earlier rejection.
+    if (env->total_tests != 0 && (env->total_tests % 512) == 0 &&
+        parent >= 0 && parent < (int)env->branch_probe_tests.size() &&
+        env->branch_probe_tests[parent] != env->total_tests)
+    {
+        env->branch_probe_tests[parent] = env->total_tests;
+        return true;
+    }
+    for (int child : branches)
+    {
+        if (child < 0 || child >= (int)env->branch_order_profiles.size() ||
+            env->branch_order_profiles[child].eval_count < 1)
+            return true;
+    }
+    return false;
+}
+
+static void optimizeSiblingOrder(SearchThreadEnv *env)
+{
+    for (size_t parent = 0; parent < env->condtree.references.size(); parent++)
+    {
+        std::vector<char>& branches = env->condtree.references[parent];
+        if (branches.size() < 2)
+            continue;
+        int parentType = env->condtree.condvec[parent].type;
+        if (parentType == F_LOGIC_OR || parentType == F_LOGIC_NOT || parentType == F_LUA)
+            continue;
+
+        std::map<int, double> scores;
+        for (int child : branches)
+        {
+            if (child < 0 || child >= (int)env->branch_order_profiles.size())
+            {
+                scores[child] = -1.0;
+                continue;
+            }
+            const auto& profile = env->branch_order_profiles[child];
+            if (profile.timed_count < 1 || profile.eval_count < 1)
+            {
+                scores[child] = -1.0;
+                continue;
+            }
+            double meanCost = (double)profile.total_ns / profile.timed_count;
+            double rejectChance = (profile.fail_count + 1.0) /
+                (profile.eval_count + 2.0);
+            scores[child] = meanCost / rejectChance;
+        }
+
+        std::stable_sort(branches.begin(), branches.end(),
+            [&](char a, char b) { return scores[(int)a] < scores[(int)b]; });
+    }
+}
+
+static void recordConditionStat(SearchThreadEnv *env, int node, int st)
+{
+    if (env->collect_condition_stats && node > 0 &&
+        node < (int)env->condtree.condvec.size())
+    {
+        env->condition_stats_events.emplace_back(node, st == COND_FAILED);
+    }
+}
+
 static
 int _testTreeAt(
     Pos                         at,             // relative origin
     SearchThreadEnv           * env,            // thread-local environment
     Pos                       * path,           // output center position(s)
     int                         node,
-    int                         depth = 0       // recursion depth tracking
+    int                         depth            // recursion depth tracking
 )
 {
     // Prevent stack overflow from infinite recursion (circular references in condition tree)
@@ -485,14 +671,15 @@ int _testTreeAt(
                     {
                         // children are combined via AND at the current position
                         int sta = COND_OK;
+                        bool trainAll = trainAllSiblingConditions(env, node, branches);
                         for (int b : branches)
                         {
-                            int stb = _testTreeAt(pos, env, path, b, depth + 1);
+                            int stb = testTreeBranch(pos, env, path, b, depth + 1);
                             if (*env->stop)
                                 return COND_FAILED;
                             if (stb < sta)
                                 sta = stb;
-                            if (sta == COND_FAILED)
+                            if (sta == COND_FAILED && !trainAll)
                                 break;
                         }
                         if (sta == COND_MAYBE_POS_VALID )
@@ -532,15 +719,18 @@ int _testTreeAt(
 
     L_scaled_to_dim:
         st = COND_OK;
+        {
+        bool trainAll = trainAllSiblingConditions(env, node, branches);
         for (int b : branches)
         {
-            int sta = _testTreeAt(pos, env, path, b, depth + 1);
+            int sta = testTreeBranch(pos, env, path, b, depth + 1);
             if (*env->stop)
                 return COND_FAILED;
             if (sta < st)
                 st = sta;
-            if (st == COND_FAILED)
+            if (st == COND_FAILED && !trainAll)
                 break;
+        }
         }
         if (path && st >= COND_MAYBE_POS_VALID)
             path[c.save] = pos;
@@ -552,6 +742,7 @@ int _testTreeAt(
         {
             if (path)
                 path[c.save].x = path[c.save].z = -1;
+            recordConditionStat(env, node, COND_OK);
             return COND_OK; // empty ORs are ignored
         }
         else
@@ -560,7 +751,7 @@ int _testTreeAt(
             st = COND_FAILED;
             for (int b : branches)
             {
-                int sta = _testTreeAt(at, env, path, b, depth + 1);
+                int sta = testTreeBranch(at, env, path, b, depth + 1);
                 if (*env->stop)
                     return COND_FAILED;
                 if (sta > st)
@@ -581,23 +772,28 @@ int _testTreeAt(
                     p->x = p->z = -1;
                 }
             }
+            recordConditionStat(env, node, st);
         }
         return st;
 
 
     case F_LOGIC_NOT: //qDebug() << at.x << at.z;
         if (branches.empty())
+        {
+            recordConditionStat(env, node, COND_FAILED);
             return COND_FAILED;
+        }
         st = COND_OK;
         for (int b : branches)
         {
-            int sta = _testTreeAt(at, env, path, b, depth + 1);
+            int sta = testTreeBranch(at, env, path, b, depth + 1);
             if (*env->stop)
                 return COND_FAILED;
             if      (sta == COND_OK) { st = COND_FAILED; break; }
             else if (sta == COND_FAILED) { st = COND_OK; break; }
             else if (sta > st) st = sta;
         }
+        recordConditionStat(env, node, st);
         return st;
 
     case F_LUA:
@@ -607,7 +803,7 @@ int _testTreeAt(
             Pos *buf = path ? path : &inst[0];
             for (int b : branches)
             {
-                int sta = _testTreeAt(at, env, buf, b, depth + 1);
+                int sta = testTreeBranch(at, env, buf, b, depth + 1);
                 if (*env->stop)
                     return COND_FAILED;
                 if (sta < st) {
@@ -623,6 +819,7 @@ int _testTreeAt(
                 return COND_FAILED;
             if (sta < st)
                 st = sta;
+            recordConditionStat(env, node, st);
         }
         return st;
 
@@ -632,6 +829,7 @@ int _testTreeAt(
         {   // this is a leaf node => check only for presence of instances
             int icnt = c.count;
             st = testCondAt(at, env, &inst[0], &icnt, &c);
+            recordConditionStat(env, node, st);
             if (path && st >= COND_MAYBE_POS_VALID)
             {
                 if (icnt == 1)
@@ -657,15 +855,17 @@ int _testTreeAt(
             else
             {
                 st = testCondAt(at, env, &inst[0], NULL, &c);
+                recordConditionStat(env, node, st);
                 if (st == COND_FAILED || st == COND_MAYBE_POS_INVAL)
                     return st;
                 pos = inst[0]; // center point of instances
             }
+            bool trainAll = trainAllSiblingConditions(env, node, branches);
             for (char b : branches)
             {
-                if (st == COND_FAILED)
+                if (st == COND_FAILED && !trainAll)
                     break;
-                int sta = _testTreeAt(pos, env, path, b, depth + 1);
+                int sta = testTreeBranch(pos, env, path, b, depth + 1);
                 if (*env->stop)
                     return COND_FAILED;
                 if (sta < st)
@@ -680,6 +880,7 @@ int _testTreeAt(
             // independent subbranches that are combined via OR
             int icnt = MAX_INSTANCES;
             st = testCondAt(at, env, &inst[0], &icnt, &c);
+            recordConditionStat(env, node, st);
             if (st == COND_FAILED || st == COND_MAYBE_POS_INVAL)
                 return st;
             int sta = COND_FAILED;
@@ -688,15 +889,16 @@ int _testTreeAt(
             {
                 int stb = COND_OK;
                 pos = inst[i];
+                bool trainAll = trainAllSiblingConditions(env, node, branches);
                 for (int b : branches) // AND dependent conditions
                 {
-                    int stc = _testTreeAt(pos, env, path, b, depth + 1);
+                    int stc = testTreeBranch(pos, env, path, b, depth + 1);
                     if (*env->stop)
                         return COND_FAILED;
                     // worst branch dictates status for instance
                     if (stc < stb)
                         stb = stc;
-                    if (stb == COND_FAILED)
+                    if (stb == COND_FAILED && !trainAll)
                         break;
                 }
                 // best instance dictates status
@@ -728,8 +930,13 @@ int testTreeAt(
     Pos                       * path            // ok trigger positions
 )
 {
+    env->condition_stats_events.clear();
+
     // Update profiling stats every 100k tests
     env->total_tests++;
+    if (env->adaptive_order_enabled && pass == PASS_FULL_64 &&
+        (env->total_tests % 64) == 0)
+        optimizeSiblingOrder(env);
     if (env->total_tests - env->last_profile_update >= 100000)
     {
         updateProfilingStats(env);
@@ -739,12 +946,40 @@ int testTreeAt(
     if (pass != PASS_FAST_48)
     {   // do a fast check before continuing with slower checks
         env->searchpass = PASS_FAST_48;
-        int st = _testTreeAt(at, env, NULL, 0);
+        env->collect_condition_stats = true;
+        int st = _testTreeAt(at, env, NULL, 0, 0);
         if (st == COND_FAILED)
+        {
+            env->collect_condition_stats = false;
+            QMutexLocker locker(&env->profile_mutex);
+            for (const auto& event : env->condition_stats_events)
+            {
+                auto& profile = env->cond_profiles[event.first];
+                profile.eval_count++;
+                if (event.second)
+                    profile.fail_count++;
+            }
+            env->condition_stats_events.clear();
             return st;
+        }
+        env->condition_stats_events.clear();
     }
     env->searchpass = pass;
-    return _testTreeAt(at, env, path, 0);
+    env->collect_condition_stats = true;
+    int st = _testTreeAt(at, env, path, 0, 0);
+    env->collect_condition_stats = false;
+    {
+        QMutexLocker locker(&env->profile_mutex);
+        for (const auto& event : env->condition_stats_events)
+        {
+            auto& profile = env->cond_profiles[event.first];
+            profile.eval_count++;
+            if (event.second)
+                profile.fail_count++;
+        }
+        env->condition_stats_events.clear();
+    }
+    return st;
 }
 
 
@@ -1032,7 +1267,9 @@ struct sample_boime_t
 {
     const Condition *cond;
     Pos at;
-    int rmaxsq;
+    int64_t rminsq;
+    int64_t rmaxsq;
+    int tested;
     int n;
     int64_t xsum;
     int64_t zsum;
@@ -1051,11 +1288,17 @@ static int f_biome_sampler(Generator *g, int scale, int x, int y, int z, void *d
         int dx = (x * scale) - info->at.x;
         int dz = (z * scale) - info->at.z;
         int64_t rsq = dx*(int64_t)dx + dz*(int64_t)dz;
+        if (info->rminsq && rsq < info->rminsq)
+            return -1;
         if (rsq >= info->rmaxsq)
             return -1;
     }
 
+    info->tested++;
+
     int id = getBiomeAt(g, scale, x, y, z);
+    if (id < 0)
+        return 0;
     uint64_t incl = 0, excl = 0;
     if (id < 128) {
         incl = info->cond->biomeToFind & (1ULL << id);
@@ -1093,9 +1336,13 @@ static int f_noise_sampler(Generator *g, int scale, int x, int y, int z, void *d
         int dx = (x * scale) - info->at.x;
         int dz = (z * scale) - info->at.z;
         int64_t rsq = dx*(int64_t)dx + dz*(int64_t)dz;
+        if (info->rminsq && rsq < info->rminsq)
+            return -1;
         if (rsq >= info->rmaxsq)
             return -1;
     }
+
+    info->tested++;
 
     const Condition *cond = info->cond;
     double v = sampleDoublePerlin(&g->bn.climate[cond->para], x, 0, z);
@@ -1122,22 +1369,402 @@ static int f_noise_sampler(Generator *g, int scale, int x, int y, int z, void *d
     return 0;
 }
 
+struct BiomeRingPoint
+{
+    int x, y, z;
+};
+
+/* Check an annulus without asking the generator for any point in the inner
+ * circle. This mirrors the modern checkForBiomes sampling logic, but builds
+ * the candidate list from the radial range first. */
+static int checkForBiomesInRadialRange(
+        Generator         *g,
+        Range              r,
+        int                dim,
+        uint64_t           seed,
+        const BiomeFilter *filter,
+        Pos                center,
+        int                radiusMin,
+        int                radiusMax,
+        volatile char     *stop)
+{
+    if (stop && *stop)
+        return 0;
+    if (radiusMin < 0 || radiusMax < radiusMin)
+        return 0;
+
+    const int64_t minSq = (int64_t)radiusMin * radiusMin;
+    const int64_t maxSq = (int64_t)radiusMax * radiusMax;
+    std::vector<BiomeRingPoint> points;
+
+    for (int k = 0; k < r.sy; k++)
+    {
+        for (int j = 0; j < r.sz; j++)
+        {
+            for (int i = 0; i < r.sx; i++)
+            {
+                int64_t px = (int64_t)(r.x + i) * r.scale;
+                int64_t pz = (int64_t)(r.z + j) * r.scale;
+                int64_t dx = px - center.x;
+                int64_t dz = pz - center.z;
+                int64_t rsq = dx * dx + dz * dz;
+                if (rsq < minSq || rsq > maxSq)
+                    continue;
+                points.push_back({r.x + i, r.y + k, r.z + j});
+            }
+        }
+    }
+
+    if (g->dim != dim || g->seed != seed)
+        applySeed(g, dim, seed);
+
+    uint64_t biomes = 0;
+    uint64_t biomesM = 0;
+    int trials = points.size();
+    if (filter->flags & BF_APPROX)
+    {
+        int t = 400 + (int) sqrt((double)trials);
+        if (trials > t)
+            trials = t;
+    }
+
+    for (int i = 0; i < trials; i++)
+    {
+        int remaining = (int)points.size() - i;
+        int k = rand() % remaining;
+        BiomeRingPoint point = points[k];
+        if (k != remaining - 1)
+            points[k] = points[remaining - 1];
+
+        if (stop && *stop)
+            break;
+
+        int id = getBiomeAt(g, r.scale, point.x, point.y, point.z);
+        if (id < 0)
+            continue;
+        if (id < 128)
+            biomes |= (1ULL << id);
+        else
+            biomesM |= (1ULL << (id - 128));
+
+        bool matchExc = (filter->biomeToExcl | filter->biomeToExclM) == 0;
+        bool matchAny = (filter->biomeToPick | filter->biomeToPickM) == 0;
+        bool matchReq = (filter->biomeToFind | filter->biomeToFindM) == 0;
+        if ((biomes & filter->biomeToExcl) ||
+            (biomesM & filter->biomeToExclM))
+            matchExc = false;
+        else
+            matchExc = true;
+        if ((biomes & filter->biomeToPick) ||
+            (biomesM & filter->biomeToPickM))
+            matchAny = true;
+        if ((biomes & filter->biomeToFind) == filter->biomeToFind &&
+            (biomesM & filter->biomeToFindM) == filter->biomeToFindM)
+            matchReq = true;
+
+        if (!matchExc)
+            break;
+        if (matchAny && matchReq)
+            break;
+    }
+
+    if (stop && *stop)
+        return 0;
+
+    bool matchExc = (filter->biomeToExcl | filter->biomeToExclM) == 0 ||
+        (((biomes & filter->biomeToExcl) == 0) &&
+         ((biomesM & filter->biomeToExclM) == 0));
+    bool matchAny = (filter->biomeToPick | filter->biomeToPickM) == 0 ||
+        ((biomes & filter->biomeToPick) ||
+         (biomesM & filter->biomeToPickM));
+    bool matchReq = (filter->biomeToFind | filter->biomeToFindM) == 0 ||
+        ((biomes & filter->biomeToFind) == filter->biomeToFind &&
+         (biomesM & filter->biomeToFindM) == filter->biomeToFindM);
+    return matchExc && matchAny && matchReq;
+}
+
+struct OceanGridPoint
+{
+    int x;
+    int z;
+
+    bool operator<(const OceanGridPoint& other) const
+    {
+        return x < other.x || (x == other.x && z < other.z);
+    }
+
+    bool operator==(const OceanGridPoint& other) const
+    {
+        return x == other.x && z == other.z;
+    }
+};
+
+static int64_t oceanCross(
+        const OceanGridPoint& origin,
+        const OceanGridPoint& a,
+        const OceanGridPoint& b)
+{
+    return (int64_t)(a.x - origin.x) * (b.z - origin.z) -
+           (int64_t)(a.z - origin.z) * (b.x - origin.x);
+}
+
+static std::vector<OceanGridPoint> oceanConvexHull(std::vector<OceanGridPoint> points)
+{
+    std::sort(points.begin(), points.end());
+    points.erase(std::unique(points.begin(), points.end()), points.end());
+    if (points.size() <= 2)
+        return points;
+
+    std::vector<OceanGridPoint> hull;
+    hull.reserve(points.size() * 2);
+    for (const OceanGridPoint& point : points)
+    {
+        while (hull.size() >= 2 &&
+               oceanCross(hull[hull.size()-2], hull.back(), point) <= 0)
+            hull.pop_back();
+        hull.push_back(point);
+    }
+    const size_t lower = hull.size();
+    for (auto it = points.rbegin() + 1; it != points.rend(); ++it)
+    {
+        while (hull.size() > lower &&
+               oceanCross(hull[hull.size()-2], hull.back(), *it) <= 0)
+            hull.pop_back();
+        hull.push_back(*it);
+    }
+    if (hull.size() > 1)
+        hull.pop_back();
+    return hull;
+}
+
+static int oceanClimateMask(int id)
+{
+    switch (id)
+    {
+    case warm_ocean:
+    case deep_warm_ocean:
+        return 1 << 0;
+    case lukewarm_ocean:
+    case deep_lukewarm_ocean:
+        return 1 << 1;
+    case ocean:
+    case deep_ocean:
+        return 1 << 2;
+    case cold_ocean:
+    case deep_cold_ocean:
+        return 1 << 3;
+    case frozen_ocean:
+    case deep_frozen_ocean:
+        return 1 << 4;
+    default:
+        return 0;
+    }
+}
+
+struct OceanCorridorResult
+{
+    bool valid = false;
+    int span = 0;
+    int touching = 0;
+    int averageWidth = 0;
+    Pos center = {0, 0};
+};
+
+static OceanCorridorResult checkOceanCorridorAtScale(
+        Generator *g,
+        Range r,
+        Pos origin,
+        int nearRadius,
+        int minSpan,
+        int minTouching,
+        int maxAverageWidth,
+        bool requireAllClimates,
+        bool coarse,
+        int64_t radialMinSq,
+        int64_t radialMaxSq,
+        volatile char *stop)
+{
+    OceanCorridorResult best;
+    if (r.sx <= 0 || r.sz <= 0)
+        return best;
+    const size_t cellCount = (size_t)r.sx * r.sz;
+    if (cellCount > 25000000)
+        return best;
+
+    int *ids = allocCache(g, r);
+    if (!ids)
+        return best;
+    if (genBiomes(g, ids, r))
+    {
+        free(ids);
+        return best;
+    }
+
+    std::vector<uint8_t> visited(cellCount, 0);
+    std::deque<int> queue;
+    const int nearSlack = coarse ? 2 * r.scale : r.scale / 2;
+    const int spanSlack = coarse ? 2 * r.scale : 0;
+    const int64_t nearSq = (int64_t)(nearRadius + nearSlack) *
+                           (nearRadius + nearSlack);
+    const int requiredSpan = std::max(0, minSpan - spanSlack);
+    const int64_t requiredSpanSq = (int64_t)requiredSpan * requiredSpan;
+    const int neighborCount = coarse ? 8 : 4;
+    static const int dx[8] = {-1, 1, 0, 0, -1, -1, 1, 1};
+    static const int dz[8] = {0, 0, -1, 1, -1, 1, -1, 1};
+
+    auto inSearchShape = [&](int gx, int gz) {
+        if (radialMaxSq <= 0)
+            return true;
+        int64_t bx = (int64_t)gx * r.scale;
+        int64_t bz = (int64_t)gz * r.scale;
+        int64_t ddx = bx - origin.x;
+        int64_t ddz = bz - origin.z;
+        int64_t dsq = ddx * ddx + ddz * ddz;
+        return dsq >= radialMinSq && dsq < radialMaxSq;
+    };
+
+    for (size_t start = 0; start < cellCount && !(stop && *stop); start++)
+    {
+        if (visited[start] || !isOceanic(ids[start]))
+            continue;
+        int si = start % r.sx;
+        int sj = start / r.sx;
+        if (!inSearchShape(r.x + si, r.z + sj))
+        {
+            visited[start] = 1;
+            continue;
+        }
+
+        std::vector<OceanGridPoint> warm;
+        std::vector<OceanGridPoint> frozen;
+        std::array<bool, 256> touched{};
+        int climateMask = 0;
+        uint64_t componentCells = 0;
+        bool comesNear = false;
+        int closestIndex = start;
+        int64_t closestSq = INT64_MAX;
+
+        visited[start] = 1;
+        queue.push_back(start);
+        while (!queue.empty() && !(stop && *stop))
+        {
+            int idx = queue.front();
+            queue.pop_front();
+            int i = idx % r.sx;
+            int j = idx / r.sx;
+            int gx = r.x + i;
+            int gz = r.z + j;
+            componentCells++;
+            int bx = gx * r.scale;
+            int bz = gz * r.scale;
+            int64_t ddx = (int64_t)bx - origin.x;
+            int64_t ddz = (int64_t)bz - origin.z;
+            int64_t dsq = ddx * ddx + ddz * ddz;
+            if (dsq <= nearSq)
+                comesNear = true;
+            if (dsq < closestSq)
+            {
+                closestSq = dsq;
+                closestIndex = idx;
+            }
+
+            int mask = oceanClimateMask(ids[idx]);
+            climateMask |= mask;
+            if (mask & (1 << 0))
+                warm.push_back({bx, bz});
+            if (mask & (1 << 4))
+                frozen.push_back({bx, bz});
+
+            for (int d = 0; d < 8; d++)
+            {
+                int ni = i + dx[d];
+                int nj = j + dz[d];
+                if (ni < 0 || ni >= r.sx || nj < 0 || nj >= r.sz)
+                    continue;
+                int nidx = nj * r.sx + ni;
+                if (!inSearchShape(r.x + ni, r.z + nj))
+                    continue;
+                if (!isOceanic(ids[nidx]))
+                {
+                    if (ids[nidx] >= 0 && ids[nidx] < 256)
+                        touched[ids[nidx]] = true;
+                    continue;
+                }
+                if (d < neighborCount && !visited[nidx])
+                {
+                    visited[nidx] = 1;
+                    queue.push_back(nidx);
+                }
+            }
+        }
+
+        if (!comesNear || warm.empty() || frozen.empty())
+            continue;
+        if (!coarse && requireAllClimates && climateMask != 0x1f)
+            continue;
+
+        int touching = 0;
+        for (bool value : touched)
+            touching += value;
+        if (!coarse && touching < minTouching)
+            continue;
+
+        std::vector<OceanGridPoint> warmHull = oceanConvexHull(std::move(warm));
+        std::vector<OceanGridPoint> frozenHull = oceanConvexHull(std::move(frozen));
+        int64_t maxSpanSq = 0;
+        for (const OceanGridPoint& a : warmHull)
+        {
+            for (const OceanGridPoint& b : frozenHull)
+            {
+                int64_t sx = (int64_t)a.x - b.x;
+                int64_t sz = (int64_t)a.z - b.z;
+                int64_t spanSq = sx * sx + sz * sz;
+                if (spanSq > maxSpanSq)
+                    maxSpanSq = spanSq;
+            }
+        }
+        if (maxSpanSq < requiredSpanSq)
+            continue;
+
+        int ci = closestIndex % r.sx;
+        int cj = closestIndex / r.sx;
+        int span = (int)std::floor(std::sqrt((double)maxSpanSq));
+        uint64_t sampledArea = componentCells * (uint64_t)r.scale * r.scale;
+        int averageWidth = span > 0 ?
+            (int)std::min<uint64_t>(INT_MAX, sampledArea / span) : INT_MAX;
+        if (!coarse && maxAverageWidth > 0 && averageWidth > maxAverageWidth)
+            continue;
+        if (!best.valid || touching > best.touching ||
+            (touching == best.touching && averageWidth < best.averageWidth) ||
+            (touching == best.touching && averageWidth == best.averageWidth &&
+             span > best.span))
+        {
+            best.valid = true;
+            best.span = span;
+            best.touching = touching;
+            best.averageWidth = averageWidth;
+            best.center = Pos{(r.x + ci) * r.scale, (r.z + cj) * r.scale};
+        }
+    }
+
+    free(ids);
+    return best;
+}
+
 
 
 // Helper function to update profiling statistics every 100k tests
 static void updateProfilingStats(SearchThreadEnv *env)
 {
+    QMutexLocker locker(&env->profile_mutex);
     for (auto& it : env->cond_profiles)
     {
         auto& prof = it.second;
         if (prof.samples.empty())
             continue;
         
-        // Calculate mean
-        int64_t sum = 0;
-        for (int64_t sample : prof.samples)
-            sum += sample;
-        prof.mean_ns = prof.samples.empty() ? 0 : sum / prof.samples.size();
+        // Keep a cumulative mean while median uses the bounded recent sample.
+        prof.mean_ns = prof.test_count ? prof.total_ns / prof.test_count : 0;
         
         // Calculate median
         std::vector<int64_t> sorted = prof.samples;
@@ -1147,7 +1774,8 @@ static void updateProfilingStats(SearchThreadEnv *env)
             (sorted[mid-1] + sorted[mid]) / 2 : sorted[mid]);
         
         // Calculate max
-        prof.max_ns = sorted.empty() ? 0 : sorted.back();
+        if (!sorted.empty() && sorted.back() > prof.max_ns)
+            prof.max_ns = sorted.back();
         
         // Clear samples for next batch
         prof.samples.clear();
@@ -1168,9 +1796,17 @@ struct ConditionProfiler {
         auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
         
         // Record the timing sample
+        QMutexLocker locker(&env->profile_mutex);
         auto& prof = env->cond_profiles[cond->save];
-        prof.samples.push_back(duration);
+        prof.total_ns += duration;
         prof.test_count++;
+        prof.mean_ns = prof.total_ns / prof.test_count;
+        if (duration > prof.max_ns)
+            prof.max_ns = duration;
+        if (prof.samples.size() < 2048)
+            prof.samples.push_back(duration);
+        else
+            prof.samples[prof.test_count % prof.samples.size()] = duration;
     }
 };
 
@@ -1891,7 +2527,78 @@ L_qm_any:
         return COND_FAILED;
 
 
+    case F_OCEAN_CORRIDOR:
+        if (env->searchpass != PASS_FULL_64)
+            return COND_MAYBE_POS_INVAL;
+        if (env->mc < MC_1_18)
+            return COND_FAILED;
+        if (cond->getCorridorNear() < 0 || cond->getCorridorSpan() <= 0 ||
+            cond->getCorridorTouchCount() < 0)
+            return COND_FAILED;
+
+        switch (cond->step)
+        {
+        case 4:   s = 2; break;
+        case 16:  s = 4; break;
+        case 64:  s = 6; break;
+        case 256: s = 8; break;
+        default: return COND_FAILED;
+        }
+        env->init4Dim(DIM_OVERWORLD);
+        {
+            int64_t radialMinSq = 0;
+            if (cond->rmax > 0 && cond->getRadiusMin() > 0)
+                radialMinSq = (int64_t)cond->getRadiusMin() * cond->getRadiusMin();
+            int64_t radialMaxSq = cond->rmax > 0 ? rmax : 0;
+            int coarseScale = std::min(256, (int)cond->step * 4);
+            if (coarseScale != cond->step)
+            {
+                int coarseShift = 0;
+                while ((1 << coarseShift) < coarseScale)
+                    coarseShift++;
+                Range coarseRange = {
+                    coarseScale,
+                    x1 >> coarseShift,
+                    z1 >> coarseShift,
+                    (x2 >> coarseShift) - (x1 >> coarseShift) + 1,
+                    (z2 >> coarseShift) - (z1 >> coarseShift) + 1,
+                    cond->y >> 2,
+                    1
+                };
+                OceanCorridorResult coarseResult = checkOceanCorridorAtScale(
+                    &env->g, coarseRange, at, cond->getCorridorNear(),
+                    cond->getCorridorSpan(), 0, 0, false, true,
+                    radialMinSq, radialMaxSq, (volatile char*)env->stop);
+                if (!coarseResult.valid)
+                    return COND_FAILED;
+            }
+
+            Range finalRange = {
+                (int)cond->step,
+                x1 >> s,
+                z1 >> s,
+                (x2 >> s) - (x1 >> s) + 1,
+                (z2 >> s) - (z1 >> s) + 1,
+                cond->y >> 2,
+                1
+            };
+            OceanCorridorResult result = checkOceanCorridorAtScale(
+                &env->g, finalRange, at, cond->getCorridorNear(),
+                cond->getCorridorSpan(), cond->getCorridorTouchCount(),
+                std::isfinite(cond->converage) && cond->converage > 1 ?
+                    (int)std::lround(cond->converage) : 0,
+                cond->flags & Condition::FLG_CORRIDOR_ALL_CLIMATES, false,
+                radialMinSq, radialMaxSq, (volatile char*)env->stop);
+            if (!result.valid)
+                return COND_FAILED;
+            *cent = result.center;
+            if (imax)
+                *imax = 1;
+            return COND_OK;
+        }
+
     case F_BIOME_SAMPLE:
+    case F_WATER:
     case F_NOISE_SAMPLE:
 
         if (env->searchpass != PASS_FULL_64)
@@ -1903,7 +2610,23 @@ L_qm_any:
         if (cond->type == F_NOISE_SAMPLE && env->mc <= MC_1_17)
             return COND_FAILED;
 
-        s = 2;
+        if (cond->type == F_WATER)
+        {
+            switch (cond->step)
+            {
+            case 1:   s = 0; break;
+            case 4:   s = 2; break;
+            case 16:  s = 4; break;
+            case 64:  s = 6; break;
+            case 256: s = 8; break;
+            default:  s = 2; break;
+            }
+        }
+        else
+        {
+            // Biome samples retain their historical 1:4 sampling scale.
+            s = 2;
+        }
         rx1 = x1 >> s;
         rz1 = z1 >> s;
         rx2 = x2 >> s;
@@ -1915,7 +2638,14 @@ L_qm_any:
             sample_boime_t sample;
             sample.cond = cond;
             sample.at = at;
+            sample.rminsq = 0;
+            if (cond->getRadiusMin() > 0)
+            {
+                int64_t radiusMin = cond->getRadiusMin();
+                sample.rminsq = radiusMin * radiusMin;
+            }
             sample.rmaxsq = rmax;
+            sample.tested = 0;
             sample.n = 0;
             sample.xsum = 0;
             sample.zsum = 0;
@@ -1939,6 +2669,8 @@ L_qm_any:
                 f = f_biome_sampler;
             }
             int ok = monteCarloBiomes(&env->g, r, &rng, cond->converage, cond->confidence, f, &sample);
+            if (sample.tested == 0)
+                ok = 0;
             if (imax && cond->count == 1)
             {
                 *imax = sample.n;
@@ -2141,8 +2873,18 @@ L_qm_any:
             int h = rz2 - rz1 + 1;
             int y = (s == 0 ? cond->y : cond->y >> 2);
             Range r = {1<<s, rx1, rz1, w, h, y, 1};
-            valid = checkForBiomes(&env->g, NULL, r, finfo.dim, env->seed,
-                &cond->bf, (volatile char*)env->stop) > 0;
+            if (cond->rmax > 0 && env->mc >= MC_1_18)
+            {
+                valid = checkForBiomesInRadialRange(
+                    &env->g, r, finfo.dim, env->seed, &cond->bf,
+                    Pos{at.x, at.z}, cond->getRadiusMin(), cond->rmax - 1,
+                    (volatile char*)env->stop);
+            }
+            else
+            {
+                valid = checkForBiomes(&env->g, NULL, r, finfo.dim, env->seed,
+                    &cond->bf, (volatile char*)env->stop) > 0;
+            }
         }
         return valid ? COND_OK : COND_FAILED;
 
@@ -2448,10 +3190,3 @@ void findQuadStructs(int styp, Generator *g, QVector<QuadInfo> *out)
 
     delete[] qlist;
 }
-
-
-
-
-
-
-

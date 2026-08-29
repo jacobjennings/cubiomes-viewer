@@ -9,7 +9,7 @@
    <item row="2" column="0">
     <widget class="QLabel" name="labelCenterOn">
      <property name="toolTip">
-      <string>Center structure analysis on a structure filter (e.g., quad hut) instead of world origin</string>
+      <string>Center structure analysis on a condition's result position instead of world origin</string>
      </property>
      <property name="text">
       <string>Center analysis on:</string>

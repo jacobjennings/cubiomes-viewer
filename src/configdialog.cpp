@@ -144,4 +144,3 @@ void ConfigDialog::on_lineGridSpacing_textChanged(const QString &text)
 {
     ui->comboGridMult->setEnabled(!text.isEmpty());
 }
-

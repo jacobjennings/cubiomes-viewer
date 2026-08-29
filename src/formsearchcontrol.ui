@@ -181,7 +181,7 @@ QPushButton:hover {
         </size>
        </property>
        <property name="toolTip">
-        <string>When a seed is selected, center the map on this structure filter</string>
+        <string>When a seed is selected, center the map on this condition's result position</string>
        </property>
       </widget>
      </item>

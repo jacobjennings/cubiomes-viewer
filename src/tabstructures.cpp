@@ -763,10 +763,7 @@ void TabStructures::updateCenterOnFilterList()
         if (c.meta & Condition::DISABLED)
             continue;
 
-        const FilterInfo& ft = g_filterinfo.list[c.type];
-        if (ft.stype > 0 || c.type == F_QH_IDEAL || c.type == F_QH_CLASSIC ||
-            c.type == F_QH_NORMAL || c.type == F_QH_BARELY ||
-            c.type == F_QM_90 || c.type == F_QM_95)
+        if (isCenterableFilter(c.type))
         {
             QString summary = c.summary(false);
             ui->comboCenterOn->addItem(summary, c.save);

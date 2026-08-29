@@ -23,6 +23,7 @@
 #include <QWidget>
 #include <QTextStream>
 
+#include <cmath>
 
 #define WARNING_CHAR QChar(0x26A0)
 
@@ -30,6 +31,12 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
     : QDialog(parent, Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint)
     , ui(new Ui::ConditionDialog)
     , luahash()
+    , corridorOptions(nullptr)
+    , corridorNear(nullptr)
+    , corridorSpan(nullptr)
+    , corridorTouchCount(nullptr)
+    , corridorMaxWidth(nullptr)
+    , corridorAllClimates(nullptr)
     , mapview(mapview)
     , config(config)
     , item(item)
@@ -37,6 +44,38 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
 {
     memset(&cond, 0, sizeof(cond));
     ui->setupUi(this);
+
+    corridorOptions = new QGroupBox(tr("Connected ocean requirements"), this);
+    QGridLayout *corridorLayout = new QGridLayout(corridorOptions);
+    QLabel *corridorHelp = new QLabel(tr(
+        "The same ocean must contain warm and frozen water and enter the boat-access distance. "
+        "Width is estimated from the connected ocean inside the search area. "
+        "A broad check runs first; the selected scale is used only for likely matches."),
+        corridorOptions);
+    corridorHelp->setWordWrap(true);
+    corridorNear = new QLineEdit("1024", corridorOptions);
+    corridorSpan = new QLineEdit("8000", corridorOptions);
+    corridorTouchCount = new QSpinBox(corridorOptions);
+    corridorTouchCount->setRange(0, 256);
+    corridorTouchCount->setValue(0);
+    corridorMaxWidth = new QSpinBox(corridorOptions);
+    corridorMaxWidth->setRange(0, 30000000);
+    corridorMaxWidth->setValue(0);
+    corridorMaxWidth->setSpecialValueText(tr("No limit"));
+    corridorAllClimates = new QCheckBox(tr("Require warm, lukewarm, temperate, cold, and frozen ocean"), corridorOptions);
+    corridorAllClimates->setChecked(true);
+    corridorLayout->addWidget(corridorHelp, 0, 0, 1, 2);
+    corridorLayout->addWidget(new QLabel(tr("Boat-access distance from reference:"), corridorOptions), 1, 0);
+    corridorLayout->addWidget(corridorNear, 1, 1);
+    corridorLayout->addWidget(new QLabel(tr("Minimum warm-to-frozen separation:"), corridorOptions), 2, 0);
+    corridorLayout->addWidget(corridorSpan, 2, 1);
+    corridorLayout->addWidget(new QLabel(tr("Minimum different shore biomes:"), corridorOptions), 3, 0);
+    corridorLayout->addWidget(corridorTouchCount, 3, 1);
+    corridorLayout->addWidget(new QLabel(tr("Maximum average ocean width:"), corridorOptions), 4, 0);
+    corridorLayout->addWidget(corridorMaxWidth, 4, 1);
+    corridorLayout->addWidget(corridorAllClimates, 5, 0, 1, 2);
+    ui->gridLayout_13->addWidget(corridorOptions, 4, 0, 1, 5);
+    corridorOptions->hide();
 
     connect(ui->buttonBox, &QDialogButtonBox::accepted, this, &ConditionDialog::onAccept);
     connect(ui->buttonBox, &QDialogButtonBox::rejected, this, &ConditionDialog::onReject);
@@ -102,7 +141,10 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
 
     QIntValidator *uintval = new QIntValidator(0, 30e6, this);
     ui->lineSquare->setValidator(uintval);
+    ui->lineRadiusMin->setValidator(uintval);
     ui->lineRadius->setValidator(uintval);
+    corridorNear->setValidator(new QIntValidator(0, 30e6, this));
+    corridorSpan->setValidator(new QIntValidator(1, 30e6, this));
 
     ui->lineSpiralStep->setValidator(new QIntValidator(1, 0xffff, this));
 
@@ -235,8 +277,9 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
         climaterange[1][i] = ex;
 
         QCheckBox *all = new QCheckBox(this);
-        all->setFixedWidth(20);
-        all->setToolTip(tr("Require full range instead of intersection"));
+        all->setText(tr("whole"));
+        all->setFixedWidth(60);
+        all->setToolTip(tr("Checked: the whole Required range must occur in the area. Unchecked: any one point in the area may be in the Required range."));
         connect(all, SIGNAL(stateChanged(int)), this, SLOT(onClimateLimitChanged()));
         climatecomplete[i] = all;
 
@@ -307,6 +350,8 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
     ui->checkSkipRef->setChecked(false);
     ui->radioSquare->setChecked(true);
     ui->checkRadius->setChecked(false);
+    ui->lineRadiusMin->setText("0");
+    ui->lineRadius->setText("0");
     ui->lineCoverage1->setText("50");
     ui->lineCoverage2->setText("50");
     ui->lineConfidence1->setText("95");
@@ -372,6 +417,16 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
         ui->lineCoverage2->setText(QString::number(cond.converage ? cond.converage * 100 : 50));
         ui->lineConfidence1->setText(QString::number(cond.confidence ? cond.confidence * 100 : 95));
         ui->lineConfidence2->setText(QString::number(cond.confidence ? cond.confidence * 100 : 95));
+        if (cond.type == F_OCEAN_CORRIDOR)
+        {
+            corridorNear->setText(QString::number(cond.getCorridorNear()));
+            corridorSpan->setText(QString::number(cond.getCorridorSpan()));
+            corridorTouchCount->setValue(cond.getCorridorTouchCount());
+            corridorMaxWidth->setValue(
+                std::isfinite(cond.converage) && cond.converage > 1 ?
+                    (int)std::lround(cond.converage) : 0);
+            corridorAllClimates->setChecked(cond.flags & Condition::FLG_CORRIDOR_ALL_CLIMATES);
+        }
 
         if (cond.x1 == cond.z1 && cond.x1 == -cond.x2 && cond.x1 == -cond.z2)
         {
@@ -388,9 +443,10 @@ ConditionDialog::ConditionDialog(FormConditions *parent, MapView *mapview, Confi
             ui->radioCustom->setChecked(true);
         }
 
-        if (cond.rmax > 0)
+        if (cond.rmax > 0 || cond.getRadiusMin() > 0)
         {
-            ui->lineRadius->setText(QString::number(cond.rmax - 1));
+            ui->lineRadiusMin->setText(QString::number(cond.getRadiusMin()));
+            ui->lineRadius->setText(QString::number(cond.rmax > 0 ? cond.rmax - 1 : 0));
             ui->checkRadius->setChecked(true);
         }
 
@@ -505,6 +561,15 @@ void ConditionDialog::updateMode()
 {
     int filterindex = ui->comboType->currentData().toInt();
     const FilterInfo &ft = g_filterinfo.list[filterindex];
+    const bool corridor = filterindex == F_OCEAN_CORRIDOR;
+
+    corridorOptions->setVisible(corridor);
+    ui->scrollBiomes->setVisible(!corridor);
+    ui->buttonUncheck->setVisible(!corridor);
+    ui->buttonInclude->setVisible(!corridor);
+    ui->buttonExclude->setVisible(!corridor);
+    ui->checkApprox->setVisible(!corridor);
+    ui->checkMatchAny->setVisible(!corridor);
 
     ui->lineSummary->setPlaceholderText(QApplication::translate("Filter", ft.name));
 
@@ -523,6 +588,7 @@ void ConditionDialog::updateMode()
 
     if (ui->checkRadius->isEnabled() && ui->checkRadius->isChecked())
     {
+        ui->lineRadiusMin->setEnabled(true);
         ui->lineRadius->setEnabled(true);
 
         ui->radioSquare->setEnabled(false);
@@ -541,6 +607,7 @@ void ConditionDialog::updateMode()
     }
     else
     {
+        ui->lineRadiusMin->setEnabled(false);
         ui->lineRadius->setEnabled(false);
 
         ui->radioSquare->setEnabled(p2);
@@ -622,10 +689,27 @@ void ConditionDialog::updateMode()
     else if (ft.cat == CAT_BIOMES)
     {
         ui->stackedWidget->setCurrentWidget(ui->pageBiomes);
-        ui->checkApprox->setEnabled(wi.mc <= MC_1_17 || ft.grid == 4);
-        ui->checkMatchAny->setEnabled(true);
-        if (filterindex == F_BIOME_SAMPLE)
+        bool waterOnly = filterindex == F_WATER;
+        ui->groupBox_7->setTitle(corridor ? tr("Ocean corridor") :
+            (waterOnly ? tr("Water biomes (all)") : tr("Biomes")));
+        ui->label_17->setText(waterOnly ? tr("Required water coverage (%):") : tr("Required coverage (%):"));
+        ui->label_18->setText(tr("Confidence (%):"));
+        ui->checkApprox->setEnabled(!waterOnly && (wi.mc <= MC_1_17 || ft.grid == 4));
+        if (waterOnly)
+            ui->checkApprox->setChecked(false);
+        ui->checkMatchAny->setEnabled(!waterOnly);
+        ui->buttonUncheck->setEnabled(!waterOnly);
+        ui->buttonInclude->setEnabled(!waterOnly);
+        ui->buttonExclude->setEnabled(!waterOnly);
+        ui->checkSamplePos->setVisible(filterindex == F_BIOME_SAMPLE);
+        ui->checkSamplePos->setEnabled(filterindex == F_BIOME_SAMPLE);
+        if (filterindex == F_BIOME_SAMPLE || filterindex == F_WATER)
             ui->stackedBiome->setCurrentWidget(ui->pageBiomeOptSample);
+        else if (corridor)
+        {
+            ui->stackedBiome->setCurrentWidget(ui->pageBiomeOpt);
+            ui->labelBiomeScale->setText(tr("Final detail:"));
+        }
         else if (filterindex == F_BIOME_COUNT)
         {
             ui->stackedBiome->setCurrentWidget(ui->pageBiomeOpt);
@@ -738,12 +822,16 @@ void ConditionDialog::updateBiomeSelection()
     int filter = ui->comboType->currentData().toInt();
     int scale = ui->comboScale->currentData().toInt();
     const FilterInfo &ft = g_filterinfo.list[filter];
+    auto isWaterBiome = [](int id) {
+        return isOceanic(id) || id == river || id == frozen_river;
+    };
 
     // clear tool tips
     for (const auto& it : biomecboxes)
         it.second->setToolTip("");
 
-    ui->labelBiomeScale->setText(tr("Sampling scale:"));
+    ui->labelBiomeScale->setText(filter == F_OCEAN_CORRIDOR ?
+        tr("Final detail:") : tr("Sampling scale:"));
     ui->comboScale->setEnabled(false);
     for (int i = 0, n = ui->comboScale->count(); i < n; i++)
     {
@@ -754,7 +842,22 @@ void ConditionDialog::updateBiomeSelection()
 
     std::vector<int> available;
 
-    if (filter == F_BIOME_NETHER || filter == F_BIOME_END)
+    if (filter == F_WATER || filter == F_OCEAN_CORRIDOR)
+    {
+        ui->comboScale->setEnabled(true);
+        if (filter == F_OCEAN_CORRIDOR)
+        {
+            int idx1 = ui->comboScale->findData(QVariant::fromValue(1));
+            ui->comboScale->setItemData(idx1, false, Qt::UserRole-1);
+        }
+        for (const auto& it : biomecboxes)
+        {
+            if ((filter == F_WATER && isWaterBiome(it.first)) ||
+                (filter == F_OCEAN_CORRIDOR && isOceanic(it.first)))
+                available.push_back(it.first);
+        }
+    }
+    else if (filter == F_BIOME_NETHER || filter == F_BIOME_END)
     {
         ui->comboScale->setEnabled(true);
         if (filter == F_BIOME_END)
@@ -849,11 +952,7 @@ void ConditionDialog::updateBiomeSelection()
         auto isCaveBiome = [](int id) {
             return id == dripstone_caves || id == lush_caves || id == deep_dark;
         };
-        
-        // Helper function to check if biome is a water biome (ocean or river)
-        auto isWaterBiome = [](int id) {
-            return isOceanic(id) || id == river || id == frozen_river;
-        };
+        bool waterOnly = filter == F_WATER || filter == F_OCEAN_CORRIDOR;
         
         // separate available biomes into cave, water, and regular
         QLayoutItem *sep = ui->gridLayoutBiomes->takeAt(ui->gridLayoutBiomes->indexOf(separator));
@@ -981,6 +1080,18 @@ void ConditionDialog::updateBiomeSelection()
             QLayoutItem *item = items[id];
             ui->gridLayoutBiomes->addItem(item, row+i%mod, i/mod);
         }
+
+        if (waterOnly)
+        {
+            for (const auto& it : biomecboxes)
+            {
+                QCheckBox *cb = it.second;
+                bool selected = filter == F_OCEAN_CORRIDOR ?
+                    isOceanic(it.first) : isWaterBiome(it.first);
+                cb->setCheckState(selected ? Qt::PartiallyChecked : Qt::Unchecked);
+                cb->setEnabled(false);
+            }
+        }
     }
 
     if (ui->stackedWidget->currentWidget() == ui->pageBiomeCenter)
@@ -1067,6 +1178,27 @@ bool ConditionDialog::warnIfBad(Condition cond)
     }
     else if (ft.cat == CAT_BIOMES)
     {
+        if (cond.type == F_OCEAN_CORRIDOR)
+        {
+            if (cond.getCorridorSpan() <= 0 || cond.getCorridorNear() < 0 ||
+                cond.getCorridorTouchCount() < 0)
+            {
+                warn(this, tr("Invalid ocean corridor"),
+                    tr("Distances must be positive, and the shore-biome minimum cannot be negative."));
+                return false;
+            }
+            int64_t width = cond.rmax > 0 ? 2LL * (cond.rmax - 1) :
+                (int64_t)cond.x2 - cond.x1;
+            int64_t height = cond.rmax > 0 ? width : (int64_t)cond.z2 - cond.z1;
+            int64_t maximumSpanSq = width * width + height * height;
+            int64_t requestedSpanSq = (int64_t)cond.getCorridorSpan() * cond.getCorridorSpan();
+            if (requestedSpanSq > maximumSpanSq)
+            {
+                warn(this, tr("Ocean corridor area too small"),
+                    tr("The warm-to-frozen separation is longer than the diagonal of the search area."));
+                return false;
+            }
+        }
         if (wi.mc >= MC_1_18)
         {
             uint64_t m = cond.biomeToFindM;
@@ -1159,7 +1291,7 @@ void ConditionDialog::onAccept()
     c.count = ui->spinBox->value();
     c.skipref = ui->checkSkipRef->isChecked();
 
-    const FilterInfo &ft = g_filterinfo.list[cond.type];
+    const FilterInfo &ft = g_filterinfo.list[c.type];
 
     if (ui->checkEnabled->isChecked())
         c.meta &= ~Condition::DISABLED;
@@ -1194,9 +1326,23 @@ void ConditionDialog::onAccept()
     }
 
     if (ui->checkRadius->isEnabled() && ui->checkRadius->isChecked())
-        c.rmax = ui->lineRadius->text().toInt() + 1;
+    {
+        int radiusMin = ui->lineRadiusMin->text().toInt();
+        int radiusMax = ui->lineRadius->text().toInt();
+        if (radiusMin > radiusMax)
+        {
+            warn(this, tr("Invalid radial range"),
+                tr("The minimum distance must not be greater than the maximum distance."));
+            return;
+        }
+        c.setRadiusMin(radiusMin);
+        c.rmax = radiusMax + 1;
+    }
     else
+    {
+        c.setRadiusMin(0);
         c.rmax = 0;
+    }
 
     c.y = ui->comboY1->currentText().section(' ', 0, 0).toInt();
 
@@ -1209,13 +1355,29 @@ void ConditionDialog::onAccept()
         c.flags |= Condition::FLG_IN_RANGE;
     if (ui->checkInvertRange->isChecked())
         c.flags |= Condition::FLG_INVERT;
+    if (c.type == F_OCEAN_CORRIDOR && corridorAllClimates->isChecked())
+        c.flags |= Condition::FLG_CORRIDOR_ALL_CLIMATES;
 
     if (ui->stackedWidget->currentWidget() == ui->pageBiomes)
     {
         c.biomeToFind = c.biomeToFindM = 0;
         c.biomeToExcl = c.biomeToExclM = 0;
 
-        for (const auto& it : biomecboxes)
+        if (c.type == F_WATER || c.type == F_OCEAN_CORRIDOR)
+        {
+            for (int id = 0; id < 256; id++)
+            {
+                bool selected = c.type == F_OCEAN_CORRIDOR ? isOceanic(id) :
+                    (isOceanic(id) || id == river || id == frozen_river);
+                if (!selected)
+                    continue;
+                if (id < 128)
+                    c.biomeToFind |= 1ULL << id;
+                else
+                    c.biomeToFindM |= 1ULL << (id - 128);
+            }
+        }
+        else for (const auto& it : biomecboxes)
         {
             int id = it.first;
             QCheckBox *cb = it.second;
@@ -1239,12 +1401,24 @@ void ConditionDialog::onAccept()
         {
             c.count = ui->checkSamplePos->isChecked() ? 1 : 0;
         }
+        else if (c.type == F_WATER || c.type == F_OCEAN_CORRIDOR)
+        {
+            c.count = 0;
+        }
         // Otherwise, keep the count value from spinBox (already set at line 1117)
         c.converage = ui->lineCoverage1->text().toFloat() / 100.0;
         c.confidence = ui->lineConfidence1->text().toFloat() / 100.0;
         c.step = 0;
-        if (c.type == F_BIOME || c.type == F_BIOME_NETHER || c.type == F_BIOME_END || c.type == F_BIOME_COUNT)
+        if (c.type == F_BIOME || c.type == F_BIOME_NETHER || c.type == F_BIOME_END ||
+            c.type == F_BIOME_COUNT || c.type == F_WATER || c.type == F_OCEAN_CORRIDOR)
             c.step = ui->comboScale->currentData().toInt();
+        if (c.type == F_OCEAN_CORRIDOR)
+        {
+            c.setCorridorNear(corridorNear->text().toInt());
+            c.setCorridorSpan(corridorSpan->text().toInt());
+            c.setCorridorTouchCount(corridorTouchCount->value());
+            c.converage = corridorMaxWidth->value();
+        }
         if (c.type == F_BIOME_END && c.step > 64)
             c.step = 64;
     }
@@ -1361,6 +1535,12 @@ void ConditionDialog::on_comboCat_currentIndexChanged(int)
 
 void ConditionDialog::on_comboType_activated(int)
 {
+    if (ui->comboType->currentData().toInt() == F_OCEAN_CORRIDOR &&
+        cond.type != F_OCEAN_CORRIDOR)
+    {
+        ui->comboScale->setCurrentIndex(
+            ui->comboScale->findData(QVariant::fromValue(64)));
+    }
     updateMode();
 }
 

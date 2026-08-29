@@ -8,14 +8,34 @@
 #include "formconditions.h"
 
 #include <QDebug>
+#include <QClipboard>
+#include <QCryptographicHash>
+#include <QDataStream>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QRegularExpressionValidator>
+#include <QSaveFile>
 #include <QScrollBar>
+#include <QShortcut>
 #include <QTextStream>
+#include <QTimer>
+#include <QtEndian>
 
 #include <random>
 #include <unordered_set>
+
+static QByteArray seedListFingerprint(std::vector<uint64_t> seeds)
+{
+    std::sort(seeds.begin(), seeds.end());
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    for (uint64_t seed : seeds)
+    {
+        quint64 value = qToBigEndian((quint64)seed);
+        hash.addData(QByteArray::fromRawData(
+            reinterpret_cast<const char*>(&value), sizeof(value)));
+    }
+    return hash.result();
+}
 
 // AnalysisBiomes destructor
 AnalysisBiomes::~AnalysisBiomes()
@@ -186,6 +206,7 @@ void AnalysisBiomesWorker::run()
 void AnalysisBiomesWorker::runStatistics(uint64_t seed)
 {
     QVector<uint64_t> idcnt(258);
+    Pos center = {0, 0};
     
     // Get structure position offset if center-on condition is selected
     int offsetX = 0, offsetZ = 0;
@@ -205,6 +226,7 @@ void AnalysisBiomesWorker::runStatistics(uint64_t seed)
         if (result == COND_OK && path[centerCond->save].x != -1 && path[centerCond->save].z != -1)
         {
             Pos structPos = path[centerCond->save];
+            center = structPos;
             // Convert structure position from block coordinates to scaled coordinates
             // Calculate shift amount based on scale (scale = 1 << shift)
             int shift = 0;
@@ -324,7 +346,7 @@ void AnalysisBiomesWorker::runStatistics(uint64_t seed)
     idcnt[257] = totalcnt > 0 ? (watercnt * 10000) / totalcnt : 0;
 
     if (!master->stop) // discard partially processed seed
-        emit seedDone(seed, idcnt);
+        emit seedDone(seed, idcnt, center.x, center.z);
 }
 
 void AnalysisBiomesWorker::runLocate(uint64_t seed)
@@ -367,9 +389,17 @@ QVariant BiomeTableModel::data(const QModelIndex& index, int role) const
     static QVariant align = QVariant::fromValue((int)Qt::AlignCenter);
     if (role == Qt::TextAlignmentRole)
         return align;
+    if (index.column() == 0)
+    {
+        if (role == Qt::CheckStateRole)
+            return likedSeeds.contains(seeds[index.row()]) ? Qt::Checked : Qt::Unchecked;
+        if (role == Qt::UserRole+2)
+            return likedSeeds.contains(seeds[index.row()]) ? 1 : 0;
+        return QVariant();
+    }
     if (role == Qt::DisplayRole)
     {
-        int id = ids[index.column()];
+        int id = ids[index.column()-1];
         uint64_t seed = seeds[index.row()];
         QVariant val = cnt[id][seed];
         // Special formatting for water percentage column (id 257)
@@ -383,11 +413,27 @@ QVariant BiomeTableModel::data(const QModelIndex& index, int role) const
     // UserRole+2 is used for sorting - returns raw numeric values
     if (role == Qt::UserRole+2)
     {
-        int id = ids[index.column()];
+        int id = ids[index.column()-1];
         uint64_t seed = seeds[index.row()];
         return cnt[id][seed];
     }
     return QVariant();
+}
+
+bool BiomeTableModel::setData(const QModelIndex& index, const QVariant& value, int role)
+{
+    if (!index.isValid() || index.column() != 0 || role != Qt::CheckStateRole)
+        return false;
+    setLiked(seeds[index.row()], value.toInt() == Qt::Checked);
+    return true;
+}
+
+Qt::ItemFlags BiomeTableModel::flags(const QModelIndex& index) const
+{
+    Qt::ItemFlags value = QAbstractTableModel::flags(index);
+    if (index.isValid() && index.column() == 0)
+        value |= Qt::ItemIsUserCheckable;
+    return value;
 }
 
 QVariant BiomeTableModel::headerData(int section, Qt::Orientation orientation, int role) const
@@ -407,9 +453,17 @@ QVariant BiomeTableModel::headerData(int section, Qt::Orientation orientation, i
         if (role == Qt::TextAlignmentRole)
             return align;
     }
-    if (orientation == Qt::Horizontal && section < ids.size())
+    if (orientation == Qt::Horizontal && section <= ids.size())
     {
-        int id = ids[section];
+        if (section == 0)
+        {
+            if (role == Qt::DisplayRole || role == Qt::UserRole+1)
+                return tr("Liked");
+            if (role == Qt::ToolTipRole)
+                return tr("Favorite seed (Space toggles the selected row)");
+            return QVariant();
+        }
+        int id = ids[section-1];
         const char *bname = biome2str(cmp.mc, id);
         if (role == Qt::UserRole)
             return id; // identifier
@@ -446,7 +500,9 @@ void BiomeTableModel::insertIds(QSet<int>& nids)
         if (it == ids.end() || *it != id)
         {
             int i = std::distance(ids.begin(), it);
-            beginInsertColumns(QModelIndex(), i, i);
+            // Column zero is reserved for the per-seed favorite checkbox.
+            int column = i + 1;
+            beginInsertColumns(QModelIndex(), column, column);
             ids.insert(i, id);
             endInsertColumns();
         }
@@ -467,10 +523,22 @@ void BiomeTableModel::reset(int mc)
     seeds.clear();
     ids.clear();
     cnt.clear();
+    likedSeeds.clear();
     cmp.mode = IdCmp::SORT_DIM;
     cmp.dim = DIM_UNDEF;
     cmp.mc = mc;
     endResetModel();
+}
+
+void BiomeTableModel::setLiked(uint64_t seed, bool liked)
+{
+    if (liked)
+        likedSeeds.insert(seed);
+    else
+        likedSeeds.remove(seed);
+    int row = seeds.indexOf(seed);
+    if (row >= 0)
+        emit dataChanged(index(row, 0), index(row, 0), {Qt::CheckStateRole});
 }
 
 BiomeHeader::BiomeHeader(QWidget *parent)
@@ -589,6 +657,8 @@ TabBiomes::TabBiomes(MainWindow *parent)
     , updt(20)
     , nextupdate()
     , centerOnConditionSave(0)
+    , statisticsUsesSearchList(false)
+    , statisticsInvalidated(false)
 {
     ui->setupUi(this);
     
@@ -605,6 +675,13 @@ TabBiomes::TabBiomes(MainWindow *parent)
     
     // Set selection behavior to select entire rows for consistent navigation
     ui->table->setSelectionBehavior(QAbstractItemView::SelectRows);
+
+    QShortcut *toggleLiked = new QShortcut(QKeySequence(Qt::Key_Space), ui->table);
+    toggleLiked->setContext(Qt::WidgetShortcut);
+    connect(toggleLiked, &QShortcut::activated, this, &TabBiomes::toggleCurrentLiked);
+    QShortcut *copySeed = new QShortcut(QKeySequence(Qt::Key_C), ui->table);
+    copySeed->setContext(Qt::WidgetShortcut);
+    connect(copySeed, &QShortcut::activated, this, &TabBiomes::copyCurrentSeed);
 
     ui->table->setSortingEnabled(true);
 
@@ -649,6 +726,8 @@ TabBiomes::TabBiomes(MainWindow *parent)
     
     // Connect to condition changes to update the combo box
     connect(parent->formCond, &FormConditions::changed, this, &TabBiomes::updateCenterOnFilterList);
+    connect(parent->formControl, &FormSearchControl::resultsChanged,
+            this, &TabBiomes::onSearchResultsChanged);
 }
 
 TabBiomes::~TabBiomes()
@@ -730,6 +809,190 @@ void TabBiomes::load(QSettings& settings)
     updateCenterOnFilterList(); // This will restore the selection
 }
 
+QString TabBiomes::saveStatistics(const std::vector<uint64_t>& searchSeeds)
+{
+    onBufferTimeout();
+    if (!statisticsUsesSearchList || statisticsInvalidated || model->seeds.isEmpty() ||
+        seedListFingerprint(statisticsSeedList) != seedListFingerprint(searchSeeds))
+        return QString();
+
+    QByteArray raw;
+    QDataStream stream(&raw, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_5_12);
+    stream << (quint32)0x43564253 << (quint16)2; // "CVBS", format version 2
+    stream << seedListFingerprint(searchSeeds) << (qint32)model->cmp.mc;
+    stream << (qint32)dats.x1 << (qint32)dats.z1 << (qint32)dats.x2 << (qint32)dats.z2;
+    stream << (qint32)dats.scale << (quint64)dats.samples << (qint32)dats.centerOnCondSave;
+    stream << (quint32)model->seeds.size();
+    for (uint64_t seed : qAsConst(model->seeds))
+    {
+        QVector<QPair<quint16, quint64>> values;
+        for (int id : qAsConst(model->ids))
+        {
+            QVariant value = model->cnt.value(id).value(seed);
+            if (value.isValid() && value.toULongLong() != 0)
+                values.push_back(qMakePair((quint16)id, value.toULongLong()));
+        }
+        QPoint center = centers.value(seed);
+        stream << (quint64)seed << (qint32)center.x() << (qint32)center.y();
+        stream << model->isLiked(seed);
+        stream << (quint16)values.size();
+        for (const auto& value : qAsConst(values))
+            stream << value.first << value.second;
+    }
+    if (stream.status() != QDataStream::Ok)
+        return QString();
+    return QString::fromLatin1(qCompress(raw, 9).toBase64());
+}
+
+bool TabBiomes::restoreStatistics(const QString& encoded, const std::vector<uint64_t>& searchSeeds)
+{
+    if (encoded.isEmpty())
+        return false;
+
+    QByteArray packed = QByteArray::fromBase64(encoded.toLatin1());
+    quint64 rawLimit = 1024 * 1024 + (quint64)searchSeeds.size() * 3000;
+    if (packed.size() < 4 || qFromBigEndian<quint32>(packed.constData()) > rawLimit)
+        return false;
+    QByteArray raw = qUncompress(packed);
+    if (raw.isEmpty())
+        return false;
+    QDataStream stream(raw);
+    stream.setVersion(QDataStream::Qt_5_12);
+
+    quint32 magic, rows;
+    quint16 version;
+    QByteArray fingerprint;
+    qint32 mc, x1, z1, x2, z2, scale, centerOn;
+    quint64 samples;
+    stream >> magic >> version >> fingerprint >> mc;
+    stream >> x1 >> z1 >> x2 >> z2 >> scale >> samples >> centerOn >> rows;
+    if (stream.status() != QDataStream::Ok || magic != 0x43564253 || (version != 1 && version != 2) ||
+        fingerprint != seedListFingerprint(searchSeeds) || rows == 0 || rows > searchSeeds.size())
+        return false;
+
+    struct Row {
+        uint64_t seed;
+        QPoint center;
+        bool liked;
+        QVector<QPair<int, uint64_t>> values;
+    };
+    QVector<Row> restored;
+    restored.reserve(rows);
+    QSet<uint64_t> allowed;
+    for (uint64_t seed : searchSeeds)
+        allowed.insert(seed);
+    QSet<uint64_t> seen;
+    for (quint32 row = 0; row < rows; row++)
+    {
+        quint64 seed;
+        qint32 centerX, centerZ;
+        quint16 count;
+        bool liked = false;
+        stream >> seed >> centerX >> centerZ;
+        if (version == 2)
+            stream >> liked >> count;
+        else
+            stream >> count;
+        if (stream.status() != QDataStream::Ok || count > 258 ||
+            !allowed.contains(seed) || seen.contains(seed))
+            return false;
+        seen.insert(seed);
+        Row value = {(uint64_t)seed, QPoint(centerX, centerZ), liked, {}};
+        value.values.reserve(count);
+        QSet<int> rowIds;
+        for (quint16 i = 0; i < count; i++)
+        {
+            quint16 id;
+            quint64 amount;
+            stream >> id >> amount;
+            if (stream.status() != QDataStream::Ok || id > 257 || rowIds.contains(id))
+                return false;
+            rowIds.insert(id);
+            value.values.push_back(qMakePair((int)id, (uint64_t)amount));
+        }
+        restored.push_back(value);
+    }
+    if (stream.status() != QDataStream::Ok || !stream.atEnd())
+        return false;
+
+    clearStatistics();
+    model->reset(mc);
+    QSet<int> ids;
+    QList<uint64_t> seeds;
+    for (const Row& row : qAsConst(restored))
+    {
+        seeds.push_back(row.seed);
+        centers[row.seed] = row.center;
+        if (row.liked)
+            model->likedSeeds.insert(row.seed);
+        for (const auto& value : row.values)
+        {
+            ids.insert(value.first);
+            model->cnt[value.first][row.seed] = QVariant::fromValue(value.second);
+        }
+    }
+    model->insertIds(ids);
+    if (!seeds.isEmpty())
+        model->insertSeeds(seeds);
+    dats = {x1, z1, x2, z2, scale, -1, samples, centerOn};
+    statisticsSeedList = searchSeeds;
+    statisticsUsesSearchList = true;
+    statisticsInvalidated = false;
+    ui->pushExport->setEnabled(!seeds.isEmpty());
+    ui->pushFavorites->setEnabled(!seeds.isEmpty());
+    ui->table->resizeColumnsToContents();
+    on_tabWidget_currentChanged(-1);
+    return true;
+}
+
+void TabBiomes::prepareSessionLoad()
+{
+    statisticsInvalidated = true;
+    thread->stopAnalysis();
+    thread->wait();
+    // Worker-to-master and master-to-tab signals are queued. Drain both hops
+    // while results are ignored so an old analysis cannot populate the newly
+    // loaded session after this function returns.
+    QCoreApplication::sendPostedEvents(thread, QEvent::MetaCall);
+    QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+    for (QTreeWidgetItem *item : qAsConst(qbufl))
+        delete item;
+    qbufl.clear();
+    while (ui->treeLocate->topLevelItemCount() > 0)
+        delete ui->treeLocate->takeTopLevelItem(0);
+    clearStatistics();
+    statisticsSeedList.clear();
+    statisticsUsesSearchList = false;
+    ui->pushStart->setChecked(false);
+    ui->pushStart->setText(tr("Analyze"));
+}
+
+void TabBiomes::clearStatistics()
+{
+    qbufs.clear();
+    queuedCenters.clear();
+    centers.clear();
+    WorldInfo wi;
+    parent->getSeed(&wi, false);
+    model->reset(wi.mc);
+    ui->pushExport->setEnabled(false);
+    ui->pushFavorites->setEnabled(false);
+}
+
+void TabBiomes::onSearchResultsChanged()
+{
+    if (!statisticsUsesSearchList ||
+        seedListFingerprint(statisticsSeedList) == seedListFingerprint(parent->formControl->getResults()))
+        return;
+    statisticsInvalidated = true;
+    if (thread->isRunning() && thread->dat.locate < 0)
+        thread->stopAnalysis();
+    clearStatistics();
+    statisticsSeedList.clear();
+    statisticsUsesSearchList = false;
+}
+
 void TabBiomes::refreshBiomes(int activeid)
 {
     WorldInfo wi;
@@ -794,7 +1057,7 @@ void TabBiomes::onVHeaderClicked(int row)
         wi.seed = seed;
         parent->setSeed(wi);
         
-        // If a center-on filter is selected, center the map on that structure
+        // If a center-on filter is selected, center the map on its result position.
         if (centerOnConditionSave > 0)
         {
             Pos pos;
@@ -810,7 +1073,9 @@ void TabBiomes::onTableCurrentChanged(const QModelIndex &current, const QModelIn
 {
     (void) previous;
     if (!current.isValid())
+    {
         return;
+    }
     
     // Get the row from the current cell
     int row = current.row();
@@ -823,7 +1088,7 @@ void TabBiomes::onTableCurrentChanged(const QModelIndex &current, const QModelIn
         wi.seed = seed;
         parent->setSeed(wi);
         
-        // If a center-on filter is selected, center the map on that structure
+        // If a center-on filter is selected, center the map on its result position.
         if (centerOnConditionSave > 0)
         {
             Pos pos;
@@ -835,8 +1100,11 @@ void TabBiomes::onTableCurrentChanged(const QModelIndex &current, const QModelIn
     }
 }
 
-void TabBiomes::onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt)
+void TabBiomes::onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt, int centerX, int centerZ)
 {
+    if (statisticsInvalidated)
+        return;
+    queuedCenters[seed] = QPoint(centerX, centerZ);
     idcnt.push_back(seed);
     qbufs.push_back(idcnt);
     quint64 ns = elapsed.nsecsElapsed();
@@ -849,6 +1117,11 @@ void TabBiomes::onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt)
 
 void TabBiomes::onAnalysisSeedItem(QTreeWidgetItem *item)
 {
+    if (statisticsInvalidated)
+    {
+        delete item;
+        return;
+    }
     qbufl.push_back(item);
     quint64 ns = elapsed.nsecsElapsed();
     if (ns > nextupdate)
@@ -881,7 +1154,7 @@ void TabBiomes::onBufferTimeout()
         // store column widths to track which columns need to widen
         QMap<int, int> colwidth;
         for (int c = 0, n = model->ids.size(); c < n; c++)
-            colwidth[model->ids[c]] = ui->table->columnWidth(c);
+            colwidth[model->ids[c]] = ui->table->columnWidth(c+1);
 
         QList<uint64_t> new_seeds;
         QSet<int> new_ids;
@@ -894,6 +1167,7 @@ void TabBiomes::onBufferTimeout()
             scnt.resize(scnt.size()-1);
 
             new_seeds.push_back(seed);
+            centers[seed] = queuedCenters.take(seed);
             for (int id = 0, idn = scnt.size(); id < idn; id++)
             {
                 uint64_t cnt = scnt[id];
@@ -913,7 +1187,8 @@ void TabBiomes::onBufferTimeout()
         ui->table->setSortingEnabled(true);
 
         //ui->table->resizeColumnsToContents();
-        for (int i = 0, n = proxy->columnCount(); i < n; i++)
+        ui->table->resizeColumnToContents(0);
+        for (int i = 1, n = proxy->columnCount(); i < n; i++)
         {
             int id = proxy->headerData(i, Qt::Horizontal, Qt::UserRole).toInt();
             ui->table->setColumnWidth(i, colwidth[id]);
@@ -952,6 +1227,8 @@ void TabBiomes::on_pushStart_clicked()
         thread->stopAnalysis();
         return;
     }
+
+    statisticsInvalidated = false;
 
     updt = 20;
     nextupdate = 0;
@@ -1016,6 +1293,11 @@ void TabBiomes::on_pushStart_clicked()
     }
     else
     {
+        statisticsUsesSearchList = ui->comboSeedSource->currentIndex() != 0;
+        statisticsSeedList = statisticsUsesSearchList ? thread->seeds : std::vector<uint64_t>();
+        statisticsInvalidated = false;
+        queuedCenters.clear();
+        centers.clear();
         model->reset(thread->wi.mc);
         thread->dat.locate = -1;
     }
@@ -1043,12 +1325,12 @@ void TabBiomes::on_pushStart_clicked()
         datl = thread->dat;
 
     ui->pushExport->setEnabled(false);
+    ui->pushFavorites->setEnabled(false);
     ui->pushStart->setChecked(true);
     QString progress = QString::asprintf(" (0/%zu)", thread->seeds.size());
     ui->pushStart->setText(tr("Stop") + progress);
     thread->start();
 }
-
 
 static void csvline(QTextStream& stream, const QString& qte, const QString& sep, QStringList& cols)
 {
@@ -1080,7 +1362,7 @@ void TabBiomes::exportResults(QTextStream& stream)
             stream << qte << "#samples" << sep << dats.samples << qte << "\n";
 
         QStringList header = { tr("seed") };
-        for (int col = 0, ncol = proxy->columnCount(); col < ncol; col++)
+        for (int col = 1, ncol = proxy->columnCount(); col < ncol; col++)
             header.append(proxy->headerData(col, Qt::Horizontal, Qt::UserRole+1).toString());
         csvline(stream, qte, sep, header);
 
@@ -1088,7 +1370,7 @@ void TabBiomes::exportResults(QTextStream& stream)
         {
             QStringList cols;
             cols.append(proxy->headerData(row, Qt::Vertical, Qt::UserRole+1).toString());
-            for (int col = 0, ncol = proxy->columnCount(); col < ncol; col++)
+            for (int col = 1, ncol = proxy->columnCount(); col < ncol; col++)
             {
                 QString cntstr = proxy->data(proxy->index(row, col)).toString();
                 cols.append(cntstr == "" ? "0" : cntstr);
@@ -1157,6 +1439,89 @@ void TabBiomes::on_pushExport_clicked()
 #endif
 }
 
+uint64_t TabBiomes::currentSeed() const
+{
+    QModelIndex current = ui->table->currentIndex();
+    if (!current.isValid())
+        return 0;
+    QModelIndex source = proxy->mapToSource(current);
+    if (!source.isValid() || source.row() >= model->seeds.size())
+        return 0;
+    return model->seeds[source.row()];
+}
+
+void TabBiomes::toggleCurrentLiked()
+{
+    uint64_t seed = currentSeed();
+    if (!ui->table->currentIndex().isValid())
+        return;
+    model->setLiked(seed, !model->isLiked(seed));
+}
+
+void TabBiomes::copyCurrentSeed()
+{
+    uint64_t seed = currentSeed();
+    if (!ui->table->currentIndex().isValid())
+        return;
+    QGuiApplication::clipboard()->setText(QString::number((qint64)seed));
+}
+
+QByteArray TabBiomes::favoriteSeedList(bool withCenters) const
+{
+    QByteArray content;
+    QTextStream stream(&content);
+    for (int row = 0, count = proxy->rowCount(); row < count; row++)
+    {
+        uint64_t seed = proxy->headerData(row, Qt::Vertical, Qt::UserRole).toULongLong();
+        if (!model->isLiked(seed))
+            continue;
+        stream << QString::number((qint64)seed);
+        if (withCenters)
+        {
+            QPoint center = centers.value(seed);
+            stream << ' ' << center.x() << ' ' << center.y();
+        }
+        stream << '\n';
+    }
+    stream.flush();
+    return content;
+}
+
+void TabBiomes::on_pushFavorites_clicked()
+{
+    QByteArray seeds = favoriteSeedList(false);
+    QByteArray centered = favoriteSeedList(true);
+#if WASM
+    QFileDialog::saveFileContent(seeds, "favorite_seeds.txt");
+    QFileDialog::saveFileContent(centered, "favorite_seeds_centers.txt");
+#else
+    QString fnam = QFileDialog::getSaveFileName(
+        this, tr("Export favorite seeds"), parent->prevdir + "/favorite_seeds.txt",
+        tr("Text files (*.txt);;Any files (*)"));
+    if (fnam.isEmpty())
+        return;
+
+    QFileInfo info(fnam);
+    QString suffix = info.suffix();
+    QString base = info.completeBaseName();
+    QString centerName = info.dir().filePath(
+        base + "_centers" + (suffix.isEmpty() ? QString() : "." + suffix));
+    parent->prevdir = info.absolutePath();
+
+    QSaveFile seedFile(fnam);
+    QSaveFile centerFile(centerName);
+    if (!seedFile.open(QIODevice::WriteOnly) || !centerFile.open(QIODevice::WriteOnly) ||
+        seedFile.write(seeds) != seeds.size() || centerFile.write(centered) != centered.size() ||
+        !centerFile.commit() || !seedFile.commit())
+    {
+        seedFile.cancelWriting();
+        centerFile.cancelWriting();
+        warn(parent, tr("Failed to export favorite seeds to:\n\"%1\"\nand\n\"%2\"")
+             .arg(fnam, centerName));
+    }
+#endif
+}
+
 void TabBiomes::on_buttonFromVisible_clicked()
 {
     MapView *mapview = parent->getMapView();
@@ -1216,6 +1581,8 @@ void TabBiomes::on_tabWidget_currentChanged(int)
             ok = ui->treeLocate->topLevelItemCount() > 0;
     }
     ui->pushExport->setEnabled(ok);
+    bool stats = ui->tabWidget->currentWidget() == ui->tabStats;
+    ui->pushFavorites->setEnabled(stats && !model->seeds.isEmpty());
 }
 
 void TabBiomes::on_comboCenterOn_currentIndexChanged(int index)
@@ -1235,18 +1602,13 @@ void TabBiomes::updateCenterOnFilterList()
     // Get current conditions
     const std::vector<Condition>& conds = parent->formCond->getConditions();
     
-    // Add structure filters to dropdown
+    // Add filters that produce a usable result position.
     for (const Condition& c : conds)
     {
         if (c.meta & Condition::DISABLED)
             continue;
             
-        const FilterInfo& ft = g_filterinfo.list[c.type];
-        
-        // Only add structure filters (those with stype > 0) and quad structures
-        if (ft.stype > 0 || c.type == F_QH_IDEAL || c.type == F_QH_CLASSIC || 
-            c.type == F_QH_NORMAL || c.type == F_QH_BARELY || 
-            c.type == F_QM_90 || c.type == F_QM_95)
+        if (isCenterableFilter(c.type))
         {
             QString summary = c.summary(false);
             ui->comboCenterOn->addItem(summary, c.save);
@@ -1260,4 +1622,3 @@ void TabBiomes::updateCenterOnFilterList()
     else
         centerOnConditionSave = 0;
 }
-

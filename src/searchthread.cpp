@@ -33,6 +33,8 @@ void Session::writeHeader(QTextStream& stream)
         stream << "#Cond: " << c.toHex() << "\n";
     if (centerOnBiomesConditionSave != 0)
         stream << "#CenterOnBiomes: " << centerOnBiomesConditionSave << "\n";
+    if (!biomeStatistics.isEmpty())
+        stream << "#BiomeStatistics: " << biomeStatistics << "\n";
     stream.flush();
 }
 
@@ -109,6 +111,11 @@ bool Session::load(QWidget *widget, QTextStream& stream, bool quiet)
         {
             continue;
         }
+        else if (line.startsWith("#BiomeStatistics:"))
+        {
+            biomeStatistics = line.mid(17).trimmed();
+            continue;
+        }
         else
         {   // Seeds
             QByteArray ba = line.toLocal8Bit();
@@ -143,6 +150,7 @@ SearchMaster::SearchMaster(QWidget *parent)
     , itemtimer()
     , count()
     , env()
+    , finished_condition_stats()
     , searchtype()
     , mc()
     , large()
@@ -371,6 +379,7 @@ bool SearchMaster::set(QWidget *widget, const Session& s)
     this->smax = s.sc.smax;
     this->isdone = false;
     this->stop = false;
+    finished_condition_stats.clear();
     return true;
 }
 
@@ -644,6 +653,7 @@ void SearchMaster::startSearch()
 {
     stopSearch();
     stop = false;
+    finished_condition_stats.clear();
     preSearch();
 
     if (stop)
@@ -728,6 +738,7 @@ void SearchMaster::stopSearch()
         QThread::msleep(10);
     }
 
+    captureConditionStats();
     for (SearchWorker *worker : workers)
     {
         worker->disconnect(this);
@@ -876,49 +887,76 @@ bool SearchMaster::getProgress(QString *status, uint64_t *prog, uint64_t *end, u
     return valid;
 }
 
+void SearchMaster::captureConditionStats()
+{
+    for (SearchWorker* worker : workers)
+    {
+        QMutexLocker profileLocker(&worker->env.profile_mutex);
+        for (const auto& it : worker->env.cond_profiles)
+        {
+            auto& saved = finished_condition_stats[it.first];
+            saved.first += it.second.eval_count;
+            saved.second += it.second.fail_count;
+        }
+    }
+}
+
 void SearchMaster::getProfilingData(std::vector<Condition>& conditions)
 {
     QMutexLocker locker(&mutex);
-    
-    // Aggregate profiling data from all local workers
+
+    // Keep the existing timing display and aggregate the drop-off counters.
     std::map<int, SearchThreadEnv::ConditionProfile> aggregated;
-    
+    for (const auto& it : finished_condition_stats)
+    {
+        auto& agg = aggregated[it.first];
+        agg.eval_count = it.second.first;
+        agg.fail_count = it.second.second;
+    }
+
     for (SearchWorker* worker : workers)
     {
+        QMutexLocker profileLocker(&worker->env.profile_mutex);
         for (const auto& it : worker->env.cond_profiles)
         {
             int save_idx = it.first;
             const auto& prof = it.second;
-            
             auto& agg = aggregated[save_idx];
-            
-            // Accumulate means (we'll average them)
+
+            agg.eval_count += prof.eval_count;
+            agg.fail_count += prof.fail_count;
+
             if (prof.mean_ns > 0)
             {
                 agg.mean_ns += prof.mean_ns;
                 agg.test_count++;
             }
-            
-            // Track max of medians
             if (prof.median_ns > agg.median_ns)
                 agg.median_ns = prof.median_ns;
-            
-            // Track overall max
             if (prof.max_ns > agg.max_ns)
                 agg.max_ns = prof.max_ns;
         }
     }
-    
-    // Update the conditions with aggregated profiling data
+
     for (Condition& cond : conditions)
     {
-        if (aggregated.find(cond.save) != aggregated.end())
+        const auto it = aggregated.find(cond.save);
+        if (it == aggregated.end())
         {
-            const auto& agg = aggregated[cond.save];
-            cond.prof_mean_ns = agg.test_count > 0 ? agg.mean_ns / agg.test_count : 0;
-            cond.prof_median_ns = agg.median_ns;
-            cond.prof_max_ns = agg.max_ns;
+            cond.prof_mean_ns = 0;
+            cond.prof_median_ns = 0;
+            cond.prof_max_ns = 0;
+            cond.prof_eval_count = 0;
+            cond.prof_fail_count = 0;
+            continue;
         }
+
+        const auto& agg = it->second;
+        cond.prof_mean_ns = agg.test_count > 0 ? agg.mean_ns / agg.test_count : 0;
+        cond.prof_median_ns = agg.median_ns;
+        cond.prof_max_ns = agg.max_ns;
+        cond.prof_eval_count = agg.eval_count;
+        cond.prof_fail_count = agg.fail_count;
     }
 }
 
@@ -1071,6 +1109,7 @@ void SearchMaster::onWorkerFinished()
     for (SearchWorker *worker : workers)
         if (!worker->isFinished())
             return;
+    captureConditionStats();
     for (SearchWorker *worker: workers)
         delete worker;
     workers.clear();
@@ -1259,6 +1298,3 @@ void SearchWorker::run()
         break;
     }
 }
-
-
-

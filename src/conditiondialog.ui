@@ -282,10 +282,37 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="5" colspan="2">
+          <item row="2" column="6">
            <widget class="QLineEdit" name="lineRadius">
+            <property name="toolTip">
+             <string>Maximum distance from the reference point, inclusive. Points farther away are not generated or checked.</string>
+            </property>
             <property name="text">
              <string>0</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="5">
+           <widget class="QLabel" name="labelRadiusMax">
+            <property name="text">
+             <string>to:</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="4">
+           <widget class="QLineEdit" name="lineRadiusMin">
+            <property name="toolTip">
+             <string>Minimum distance from the reference point, inclusive. Points closer than this are not generated or checked.</string>
+            </property>
+            <property name="text">
+             <string>0</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="3">
+           <widget class="QLabel" name="labelRadiusMin">
+            <property name="text">
+             <string>from:</string>
             </property>
            </widget>
           </item>
@@ -369,10 +396,13 @@ QPushButton:hover {
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="4">
+          <item row="2" column="0" colspan="3">
            <widget class="QCheckBox" name="checkRadius">
+            <property name="toolTip">
+             <string>Use only the radial band between the minimum and maximum distances. The inner area is not generated or checked.</string>
+            </property>
             <property name="text">
-             <string>Within radial distance:</string>
+             <string>Radial range:</string>
             </property>
            </widget>
           </item>
@@ -975,10 +1005,10 @@ yield each sampled position individually</string>
                  <item row="0" column="1" colspan="3">
                   <widget class="QGroupBox" name="groupBox_3">
                    <property name="toolTip">
-                    <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The climate has to enter the required range&lt;/p&gt;&lt;p&gt;With the &lt;span style=&quot; font-style:italic;&quot;&gt;complete&lt;/span&gt; modifier, the entire range must be covered&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+                    <string>The climate must enter the Required range. The small checkbox beside each parameter changes this to require the whole range to be covered.</string>
                    </property>
                    <property name="title">
-                    <string>Required:</string>
+                    <string>Required (check “whole” for full range):</string>
                    </property>
                    <layout class="QGridLayout" name="gridLayout_11">
                     <property name="leftMargin">

@@ -33,6 +33,19 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="pushFavorites">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="toolTip">
+        <string>Write liked seeds to a flat list and a second list containing each seed's center X and Z coordinates</string>
+       </property>
+       <property name="text">
+        <string>Export favorites...</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QPushButton" name="pushStart">
        <property name="text">
         <string>Analyze</string>
@@ -67,7 +80,7 @@
       <string>Center analysis on:</string>
      </property>
      <property name="toolTip">
-      <string>Center biome analysis on a structure filter (e.g., quad hut) instead of world origin</string>
+      <string>Center biome analysis on a condition's result position instead of world origin</string>
      </property>
     </widget>
    </item>
@@ -80,7 +93,7 @@
       </sizepolicy>
      </property>
      <property name="toolTip">
-      <string>Center biome analysis on this structure filter instead of world origin (0,0)</string>
+      <string>Center biome analysis on this condition instead of world origin (0,0)</string>
      </property>
     </widget>
    </item>

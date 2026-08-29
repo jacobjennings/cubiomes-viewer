@@ -558,4 +558,3 @@ void SearchConfig::write(QTextStream& stream)
         stream << "#CenterOn: " << centerOnConditionSave << "\n";
     stream.flush();
 }
-

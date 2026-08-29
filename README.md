@@ -59,6 +59,11 @@ tabs. This provides information on the amount of biomes and structures that
 are available in an area, as well as their size and positions.
 
 
+Biome statistics generated from the matching-seeds list are also saved with
+the session and restored on the next launch. Adding, removing, or clearing a
+seed invalidates those statistics; merely sorting the same seed set does not.
+
+
 ## Screenshots
 
 Screenshots were taken of Cubiomes Viewer v4.0.
@@ -109,5 +114,3 @@ components are released under their respective author licenses:
 
 NOT AN OFFICIAL MINECRAFT PRODUCT.
 NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.
-
-

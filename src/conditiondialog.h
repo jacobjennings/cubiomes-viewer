@@ -9,7 +9,10 @@
 
 #include <QCheckBox>
 #include <QDialog>
+#include <QGroupBox>
+#include <QLineEdit>
 #include <QMouseEvent>
+#include <QSpinBox>
 #include <QTextEdit>
 #include <QVBoxLayout>
 
@@ -129,6 +132,13 @@ private:
 
     QVector<VariantCheckBox*> variantboxes;
     uint64_t luahash;
+
+    QGroupBox *corridorOptions;
+    QLineEdit *corridorNear;
+    QLineEdit *corridorSpan;
+    QSpinBox *corridorTouchCount;
+    QSpinBox *corridorMaxWidth;
+    QCheckBox *corridorAllClimates;
 
 public:
     MapView *mapview;

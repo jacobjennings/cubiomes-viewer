@@ -14,6 +14,7 @@
 #include <QFileDialog>
 #include <QFontMetrics>
 #include <QMenu>
+#include <QRegularExpression>
 
 
 QVariant SeedTableModel::data(const QModelIndex& index, int role) const
@@ -386,7 +387,7 @@ QStringList FormSearchControl::getWorkerHosts() const
     
     QStringList hosts;
     // Split by newlines and commas
-    QStringList lines = text.split(QRegExp("[,\n]"), Qt::SkipEmptyParts);
+    QStringList lines = text.split(QRegularExpression("[,\n]"), Qt::SkipEmptyParts);
     for (const QString& line : lines)
     {
         QString host = line.trimmed();
@@ -406,9 +407,12 @@ void FormSearchControl::setWorkerHosts(const QStringList& hosts)
 
 void FormSearchControl::on_buttonClear_clicked()
 {
+    bool changed = !model->seeds.isEmpty();
     model->reset();
     searchProgressReset();
     ui->lineStart->setText("0");
+    if (changed)
+        emit resultsChanged();
 }
 
 void FormSearchControl::on_buttonStart_clicked()
@@ -522,7 +526,7 @@ void FormSearchControl::onSeedSelectionChanged()
     {
         emit selectedSeedChanged(s);
         
-        // If a center-on filter is selected, center the map on that structure
+        // If a center-on filter is selected, center the map on its result position.
         if (centerOnConditionSave > 0)
         {
             Pos pos;
@@ -823,7 +827,10 @@ int FormSearchControl::searchResultsAdd(std::vector<uint64_t> seeds, const std::
     }
 
     if (addcnt)
+    {
         emit resultsAdded(addcnt);
+        emit resultsChanged();
+    }
 
     return addcnt;
 }
@@ -907,6 +914,12 @@ void FormSearchControl::searchFinish(bool done)
     stimer.stop();
     onBufferTimeout();
     progressTimeout();
+    if (parent && parent->formCond)
+    {
+        std::vector<Condition> conditions = parent->formCond->getConditions();
+        sthread.getProfilingData(conditions);
+        parent->formCond->updateProfilingDisplay(conditions);
+    }
     if (done)
     {
         ui->lineStart->setText(QString::asprintf("%" PRId64, sthread.smax));
@@ -986,6 +999,7 @@ void FormSearchControl::removeCurrent()
     if (row >= 0)
     {
         model->removeRow(row);
+        emit resultsChanged();
     }
 }
 
@@ -1046,18 +1060,13 @@ void FormSearchControl::updateCenterOnFilterList()
     // Get current conditions
     const std::vector<Condition>& conds = parent->formCond->getConditions();
     
-    // Add structure filters to dropdown
+    // Add filters that produce a usable result position.
     for (const Condition& c : conds)
     {
         if (c.meta & Condition::DISABLED)
             continue;
             
-        const FilterInfo& ft = g_filterinfo.list[c.type];
-        
-        // Only add structure filters (those with stype > 0) and quad structures
-        if (ft.stype > 0 || c.type == F_QH_IDEAL || c.type == F_QH_CLASSIC || 
-            c.type == F_QH_NORMAL || c.type == F_QH_BARELY || 
-            c.type == F_QM_90 || c.type == F_QM_95)
+        if (isCenterableFilter(c.type))
         {
             QString summary = c.summary(false);
             ui->comboCenterOn->addItem(summary, c.save);

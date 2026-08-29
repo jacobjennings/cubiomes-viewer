@@ -94,6 +94,7 @@ public:
 
     QElapsedTimer elapsed1;
     QElapsedTimer frameelapsed;
+    QElapsedTimer dragframeelapsed;
     QElapsedTimer actelapsed;
     qreal decay;
 
@@ -104,6 +105,7 @@ private:
     qreal focusx, focusz;
     qreal prevx, prevz;
     qreal velx, velz;
+    qreal dragvelx, dragvelz;
     qreal mtime;
 
     bool holding;

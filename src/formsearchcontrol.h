@@ -127,6 +127,7 @@ signals:
     void selectedSeedChanged(uint64_t seed);
     void searchStatusChanged(bool running);
     void resultsAdded(int cnt);
+    void resultsChanged();
 
 public slots:
     void setSearchRange(uint64_t smin, uint64_t smax);

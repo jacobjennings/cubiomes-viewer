@@ -8,7 +8,12 @@
 #include <QVector>
 #include <QString>
 #include <QMap>
+#include <QMutex>
 #include <atomic>
+#include <cstring>
+#include <map>
+#include <utility>
+#include <vector>
 
 enum
 {
@@ -93,6 +98,8 @@ enum
     F_NOISE_SAMPLE,
     F_CHAMBERS,
     F_BIOME_COUNT,
+    F_WATER,
+    F_OCEAN_CORRIDOR,
     // new filters should be added here at the end to keep some downwards compatibility
     FILTER_MAX,
 };
@@ -276,12 +283,13 @@ static const struct FilterList : private FilterInfo
         };
 
         list[F_BIOME] = FilterInfo{
-            CAT_BIOMES, 1, LOC_REC, 0, 1, BR_NONE, MC_B1_7, MC_NEWEST, 0, 1, disp++,
+            CAT_BIOMES, 1, LOC_RAD, 0, 1, BR_NONE, MC_B1_7, MC_NEWEST, 0, 1, disp++,
             "overworld",
             QT_TRANSLATE_NOOP("Filter", "Overworld at scale"),
             QT_TRANSLATE_NOOP("Filter",
             "Allows only seeds with the included (+) biomes in the specified area and "
-            "discard those that have biomes that are explicitly excluded (-).")
+            "discard those that have biomes that are explicitly excluded (-). A radial "
+            "range may be used instead of a rectangle.")
         };
         list[F_BIOME_NETHER] = FilterInfo{
             CAT_BIOMES, 0, LOC_REC, 0, 1, BR_NONE, MC_1_16_1, MC_NEWEST, -1, 1, disp++,
@@ -565,9 +573,38 @@ static const struct FilterList : private FilterInfo
             "Checks only scattered return gateways. Does not include those generated "
             "when defeating the dragon.")
         };
+
+        list[F_WATER] = FilterInfo{
+            CAT_BIOMES, 1, LOC_RAD, 0, 1, BR_NONE, MC_B1_7, MC_NEWEST, 0, 1, disp++,
+            "overworld",
+            QT_TRANSLATE_NOOP("Filter", "Water coverage"),
+            QT_TRANSLATE_NOOP("Filter",
+            "Samples the Overworld at the selected scale and checks that the required "
+            "percentage of sampled points are ocean or river biomes. Includes all "
+            "ocean variants and both river biomes.")
+        };
+        list[F_OCEAN_CORRIDOR] = FilterInfo{
+            CAT_BIOMES, 1, LOC_RAD, 0, 1, BR_NONE, MC_1_18, MC_NEWEST, 0, 1, disp++,
+            "overworld",
+            QT_TRANSLATE_NOOP("Filter", "Ocean corridor"),
+            QT_TRANSLATE_NOOP("Filter",
+            "Finds one connected ocean that contains warm and frozen water, "
+            "passes near the reference point, and spans the requested distance. "
+            "A cheap broad pass runs before the selected detail scale.")
+        };
     }
 }
 g_filterinfo;
+
+inline bool isCenterableFilter(int type)
+{
+    if (type < 0 || type >= FILTER_MAX)
+        return false;
+
+    const FilterInfo& ft = g_filterinfo.list[type];
+    return ft.cat == CAT_STRUCT || ft.cat == CAT_QUAD || ft.cat == CAT_BIOMES ||
+           type == F_FIRST_STRONGHOLD;
+}
 
 
 struct /*__attribute__((packed))*/ Condition
@@ -591,6 +628,7 @@ struct /*__attribute__((packed))*/ Condition
         FLG_MATCH_ANY   = 0x0010,
         FLG_IN_RANGE    = 0x0020,
         FLG_INVERT      = 0x0040,
+        FLG_CORRIDOR_ALL_CLIMATES = 0x0080,
     };
     enum { // variant flags
         VAR_WITH_START  = 0x0001, // restrict start piece index and biome
@@ -617,7 +655,9 @@ struct /*__attribute__((packed))*/ Condition
     char        text[28];
     uint8_t     pad1[12]; // legacy
     uint64_t    hash;
-    int8_t      deps[16]; // currently unused
+    // The first reserved dependency bytes store the optional minimum radial
+    // distance. Keeping it here preserves the on-disk condition layout.
+    int8_t      deps[16];
     uint64_t    biomeToFind, biomeToFindM; // inclusion biomes
     int32_t     biomeId; // legacy oceanToFind(8)
     uint32_t    biomeSize;
@@ -651,12 +691,62 @@ struct /*__attribute__((packed))*/ Condition
     int64_t     prof_mean_ns;
     int64_t     prof_median_ns;
     int64_t     prof_max_ns;
+    uint64_t    prof_eval_count;
+    uint64_t    prof_fail_count;
 
     // perform version upgrades
     bool versionUpgrade();
 
     // initialize the generated members
     QString apply(int mc);
+
+    int32_t getRadiusMin() const
+    {
+        int32_t value = 0;
+        memcpy(&value, deps, sizeof(value));
+        return value;
+    }
+
+    void setRadiusMin(int32_t value)
+    {
+        memcpy(deps, &value, sizeof(value));
+    }
+
+    int32_t getCorridorNear() const
+    {
+        int32_t value = 0;
+        memcpy(&value, deps + 4, sizeof(value));
+        return value;
+    }
+
+    void setCorridorNear(int32_t value)
+    {
+        memcpy(deps + 4, &value, sizeof(value));
+    }
+
+    int32_t getCorridorSpan() const
+    {
+        int32_t value = 0;
+        memcpy(&value, deps + 8, sizeof(value));
+        return value;
+    }
+
+    void setCorridorSpan(int32_t value)
+    {
+        memcpy(deps + 8, &value, sizeof(value));
+    }
+
+    int32_t getCorridorTouchCount() const
+    {
+        int32_t value = 0;
+        memcpy(&value, deps + 12, sizeof(value));
+        return value;
+    }
+
+    void setCorridorTouchCount(int32_t value)
+    {
+        memcpy(deps + 12, &value, sizeof(value));
+    }
 
     QString toHex() const;
     bool readHex(const QString& hex);
@@ -719,10 +809,32 @@ struct SearchThreadEnv
         int64_t mean_ns;
         int64_t median_ns;
         int64_t max_ns;
+        uint64_t total_ns;
         uint64_t test_count;
-        ConditionProfile() : mean_ns(0), median_ns(0), max_ns(0), test_count(0) {}
+        uint64_t eval_count;
+        uint64_t fail_count;
+        ConditionProfile()
+            : mean_ns(0), median_ns(0), max_ns(0), total_ns(0), test_count(0),
+              eval_count(0), fail_count(0) {}
     };
     std::map<int, ConditionProfile> cond_profiles; // keyed by condition save index
+
+    // Worker-local measurements used to order AND siblings. These stay
+    // separate from the UI profiler so the hot search path needs no lock.
+    struct BranchOrderProfile {
+        uint64_t total_ns;
+        uint64_t timed_count;
+        uint64_t eval_count;
+        uint64_t fail_count;
+        BranchOrderProfile()
+            : total_ns(0), timed_count(0), eval_count(0), fail_count(0) {}
+    };
+    std::vector<BranchOrderProfile> branch_order_profiles;
+    std::vector<uint64_t> branch_probe_tests;
+    bool adaptive_order_enabled;
+    QMutex profile_mutex;
+    std::vector<std::pair<int, bool>> condition_stats_events;
+    bool collect_condition_stats;
     uint64_t total_tests;  // total number of seed tests
     uint64_t last_profile_update; // last test count when we updated profiles
 

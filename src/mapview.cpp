@@ -44,6 +44,7 @@ MapView::MapView(QWidget *parent)
     , focusx(),focusz()
     , prevx(),prevz()
     , velx(), velz()
+    , dragvelx(), dragvelz()
     , mtime()
     , holding()
     , mstart(),mprev()
@@ -66,6 +67,7 @@ MapView::MapView(QWidget *parent)
 
     elapsed1.start();
     frameelapsed.start();
+    dragframeelapsed.start();
     actelapsed.start();
 
     overlay = new MapOverlay(this);
@@ -581,9 +583,12 @@ void MapView::mousePressEvent(QMouseEvent *e)
         prevz = focusz = getZ();
         velx = 0;
         velz = 0;
+        dragvelx = 0;
+        dragvelz = 0;
         mtime = 0;
         elapsed1.start();
         frameelapsed.start();
+        dragframeelapsed.start();
         if (e->modifiers() & Qt::ShiftModifier)
         {
             if (!measure)
@@ -604,18 +609,35 @@ void MapView::mouseMoveEvent(QMouseEvent *e)
     if ((e->buttons() & Qt::LeftButton) && holding)
     {
         QPoint d = e->pos() - mprev;
-        qreal dt = elapsed1.nsecsElapsed() * 1e-9;
-        if (dt > .005)
+        if (!d.isNull())
         {
-            mtime = dt;
-            prevx = focusx;
-            prevz = focusz;
+            // Apply every delivered pointer position. QWidget::update()
+            // coalesces repaints, while a separate timer limits rendering.
+            // This keeps the viewport position accurate on high-rate mice
+            // without redrawing faster than the display can show.
+            mtime += elapsed1.nsecsElapsed() * 1e-9;
             focusx = focusx - d.x() / blocks2pix;
             focusz = focusz - d.y() / blocks2pix;
+
+            // Estimate release velocity over a stable interval rather than
+            // from a potentially sub-millisecond final mouse event.
+            if (mtime >= .04)
+            {
+                dragvelx = (focusx - prevx) / mtime;
+                dragvelz = (focusz - prevz) / mtime;
+                prevx = focusx;
+                prevz = focusz;
+                mtime = 0;
+            }
+
+            mprev = e->pos();
             elapsed1.start();
+            if (dragframeelapsed.nsecsElapsed() >= 16666667)
+            {
+                dragframeelapsed.start();
+                update();//repaint();
+            }
         }
-        mprev = e->pos();
-        update();//repaint();
     }
 }
 
@@ -630,8 +652,20 @@ void MapView::mouseReleaseEvent(QMouseEvent *e)
             QPoint d = e->pos() - mprev;
             focusx = focusx - d.x() / blocks2pix;
             focusz = focusz - d.y() / blocks2pix;
-            velx = (focusx - prevx) / mtime;
-            velz = (focusz - prevz) / mtime;
+
+            // A short partial interval is less reliable than the most recent
+            // complete velocity sample. Longer idle intervals intentionally
+            // reduce the release speed toward zero.
+            if (mtime >= .01)
+            {
+                dragvelx = (focusx - prevx) / mtime;
+                dragvelz = (focusz - prevz) / mtime;
+            }
+
+            // getX()/getZ() store velocity as the remaining exponential
+            // travel distance, so convert from blocks/second using decay.
+            velx = dragvelx / decay;
+            velz = dragvelz / decay;
             frameelapsed.start();
             update();
         }
@@ -687,4 +721,3 @@ void MapView::keyPressEvent(QKeyEvent *e)
     }
     QWidget::keyPressEvent(e);
 }
-

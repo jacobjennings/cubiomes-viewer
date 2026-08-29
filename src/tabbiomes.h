@@ -6,6 +6,7 @@
 #include <QTreeWidgetItem>
 #include <QSortFilterProxyModel>
 #include <QHeaderView>
+#include <QPoint>
 #include <QMutex>
 
 #include "mainwindow.h"
@@ -33,7 +34,7 @@ public:
     void runLocate(uint64_t seed);
 
 signals:
-    void seedDone(uint64_t seed, QVector<uint64_t> cnt);
+    void seedDone(uint64_t seed, QVector<uint64_t> cnt, int centerX, int centerZ);
     void seedItem(QTreeWidgetItem *item);
 
 private:
@@ -59,7 +60,7 @@ public:
     TabBiomes *tabbiomes; // reference to parent TabBiomes for structure position lookup
 
 signals:
-    void seedDone(uint64_t seed, QVector<uint64_t> cnt);
+    void seedDone(uint64_t seed, QVector<uint64_t> cnt, int centerX, int centerZ);
     void seedItem(QTreeWidgetItem *item);
     void finished();
 
@@ -104,18 +105,23 @@ public:
     virtual ~BiomeTableModel() {}
 
     virtual int rowCount(const QModelIndex&) const override { return seeds.size(); }
-    virtual int columnCount(const QModelIndex&) const override { return ids.size(); }
+    virtual int columnCount(const QModelIndex&) const override { return ids.size() + 1; }
 
     virtual QVariant data(const QModelIndex& index, int role) const override;
     virtual QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
+    virtual bool setData(const QModelIndex& index, const QVariant& value, int role) override;
+    virtual Qt::ItemFlags flags(const QModelIndex& index) const override;
 
     void insertIds(QSet<int>& ids);
     void insertSeeds(QList<uint64_t>& seeds);
     void reset(int mc);
+    void setLiked(uint64_t seed, bool liked);
+    bool isLiked(uint64_t seed) const { return likedSeeds.contains(seed); }
 
     QList<int> ids; // biome column
     QList<uint64_t> seeds; // seed rows
     QMap<int, QMap<uint64_t, QVariant>> cnt; // cnt[id][seed]
+    QSet<uint64_t> likedSeeds;
     IdCmp cmp;
 };
 
@@ -188,6 +194,9 @@ public:
     // Getter/setter for center-on condition save index (for session save/load)
     int getCenterOnConditionSave() const { return centerOnConditionSave; }
     void setCenterOnConditionSave(int save) { centerOnConditionSave = save; }
+    QString saveStatistics(const std::vector<uint64_t>& searchSeeds);
+    bool restoreStatistics(const QString& encoded, const std::vector<uint64_t>& searchSeeds);
+    void prepareSessionLoad();
 
 public slots:
     void updateCenterOnFilterList();
@@ -197,22 +206,29 @@ private slots:
     void onTableSort(int column, Qt::SortOrder);
     void onVHeaderClicked(int row);
     void onTableCurrentChanged(const QModelIndex &current, const QModelIndex &previous);
-    void onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt);
+    void onAnalysisSeedDone(uint64_t seed, QVector<uint64_t> idcnt, int centerX, int centerZ);
     void onAnalysisSeedItem(QTreeWidgetItem *item);
     void onAnalysisFinished();
     void onBufferTimeout();
 
     void on_pushStart_clicked();
     void on_pushExport_clicked();
+    void on_pushFavorites_clicked();
     void on_buttonFromVisible_clicked();
     void on_radioFullSample_toggled(bool checked);
     void on_lineBiomeSize_textChanged(const QString &arg1);
     void on_treeLocate_itemClicked(QTreeWidgetItem *item, int column);
     void on_tabWidget_currentChanged(int index);
     void on_comboCenterOn_currentIndexChanged(int index);
+    void onSearchResultsChanged();
 
 private:
     void exportResults(QTextStream& stream);
+    void clearStatistics();
+    uint64_t currentSeed() const;
+    void toggleCurrentLiked();
+    void copyCurrentSeed();
+    QByteArray favoriteSeedList(bool withCenters) const;
 
 private:
     Ui::TabBiomes *ui;
@@ -228,8 +244,14 @@ private:
     uint64_t updt;
     uint64_t nextupdate;
     QVector<QVector<uint64_t>> qbufs;
+    QMap<uint64_t, QPoint> queuedCenters;
+    QMap<uint64_t, QPoint> centers;
     QList<QTreeWidgetItem*> qbufl;
     int centerOnConditionSave; // selected condition save index (0 = world origin)
+    std::vector<uint64_t> statisticsSeedList;
+    bool statisticsUsesSearchList;
+    bool statisticsInvalidated;
+
 };
 
 #endif // TABBIOMES_H

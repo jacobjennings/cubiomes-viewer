@@ -2,3 +2,5 @@ cubiomes-viewer.pro.user
 build
 src/libwinsane/*.o
 **/.directory
+__pycache__/
+*.py[cod]

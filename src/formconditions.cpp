@@ -118,6 +118,8 @@ void FormConditions::updateProfilingDisplay(const std::vector<Condition>& condit
                 c.prof_mean_ns = new_cond.prof_mean_ns;
                 c.prof_median_ns = new_cond.prof_median_ns;
                 c.prof_max_ns = new_cond.prof_max_ns;
+                c.prof_eval_count = new_cond.prof_eval_count;
+                c.prof_fail_count = new_cond.prof_fail_count;
                 
                 // Update display text
                 QString s = c.summary(true);
@@ -232,6 +234,13 @@ void FormConditions::setItemCondition(QListWidget *list, QListWidgetItem *item, 
         cond->save = getIndex(cond->save);
     }
 
+    // A changed condition must not keep statistics from an earlier search.
+    cond->prof_mean_ns = 0;
+    cond->prof_median_ns = 0;
+    cond->prof_max_ns = 0;
+    cond->prof_eval_count = 0;
+    cond->prof_fail_count = 0;
+
     QString s = cond->summary(true);
 
     const FilterInfo& ft = g_filterinfo.list[cond->type];
@@ -284,6 +293,11 @@ void FormConditions::on_buttonDisable_clicked()
     {
         Condition c = qvariant_cast<Condition>(item->data(Qt::UserRole));
         c.meta ^= Condition::DISABLED;
+        c.prof_mean_ns = 0;
+        c.prof_median_ns = 0;
+        c.prof_max_ns = 0;
+        c.prof_eval_count = 0;
+        c.prof_fail_count = 0;
         item->setText(c.summary(true));
         item->setData(Qt::UserRole, QVariant::fromValue(c));
     }
@@ -522,5 +536,3 @@ void FormConditions::keyReleaseEvent(QKeyEvent *event)
     }
     QWidget::keyReleaseEvent(event);
 }
-
-
