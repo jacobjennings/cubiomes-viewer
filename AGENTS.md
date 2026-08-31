@@ -43,6 +43,20 @@ the exact 512x512-block square centered on each biome-statistics result's
 table sort order and polls them to completion. See `README.md` ("BlueMap
 hand-off") for the user-facing contract.
 
+## Terrain viewer hand-off
+
+The biome-statistics "Open in terrain viewer" action sends the seed and centre
+to Chunk Atlas, a separate web project in `~/gh/chunkatlas`. `MainWindow::terrainViewerUrl()`
+picks its target in this order: the `CUBIOMES_TERRAIN_VIEWER_URL` override, a
+local SteelMC service if one is running or can be started, and otherwise the
+self-hosted instance at `http://chunkatlas.lan/`.
+
+That last fallback exists because the absence of a local service is not an
+error: Chunk Atlas generates terrain in the browser from WebAssembly and needs
+static files only. It used to be a GitHub Pages URL, which stopped working when
+that repository was made private. Anyone off the LAN sets the environment
+override.
+
 ## Conventions
 
 - **One shared guide.** `AGENTS.md` is canonical; tool-named entry points such
