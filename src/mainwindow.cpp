@@ -370,10 +370,11 @@ QUrl MainWindow::terrainViewerUrl()
 
 QUrl MainWindow::publishedTerrainViewerUrl()
 {
-    // The static build is deployed from the cubiomes-finds-viewer repository.
-    // Its router resolves a bare base path plus a query to the view route, so
-    // callers can append their query to this URL unchanged.
-    return QUrl("https://jacobjennings.github.io/cubiomes-finds-viewer/");
+    // Chunk Atlas is self-hosted on the LAN. The GitHub Pages copy it replaced
+    // is gone: that repository is private now, which disables Pages for it.
+    // The viewer's router resolves a bare base path plus a query to the view
+    // route, so callers append their query to this URL unchanged.
+    return QUrl("http://chunkatlas.lan/");
 }
 
 bool MainWindow::loadTranslation(QString lang)
