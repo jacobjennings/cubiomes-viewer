@@ -331,6 +331,11 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 QUrl MainWindow::terrainViewerUrl()
 {
+    // The finds viewer generates terrain in the browser from WebAssembly, so it
+    // needs static files and no server at all. The local SteelMC service is an
+    // optional upgrade that adds fully decorated chunks. Its absence must not
+    // stop the viewer opening: that produced a "service is not installed"
+    // refusal on machines where the static viewer would have worked.
     QByteArray configured = qgetenv("CUBIOMES_TERRAIN_VIEWER_URL");
     if (!configured.isEmpty())
         return QUrl(QString::fromUtf8(configured));
@@ -343,7 +348,7 @@ QUrl MainWindow::terrainViewerUrl()
     if (executable.isEmpty())
         executable = QStandardPaths::findExecutable("cubiomes-worldgen-service");
     if (executable.isEmpty())
-        return QUrl();
+        return publishedTerrainViewerUrl();
 
     QString viewer = QString::fromUtf8(qgetenv("CUBIOMES_TERRAIN_VIEWER_DIR"));
     if (viewer.isEmpty())
@@ -358,9 +363,17 @@ QUrl MainWindow::terrainViewerUrl()
     {
         terrainService->deleteLater();
         terrainService = nullptr;
-        return QUrl();
+        return publishedTerrainViewerUrl();
     }
     return localUrl;
+}
+
+QUrl MainWindow::publishedTerrainViewerUrl()
+{
+    // The static build is deployed from the cubiomes-finds-viewer repository.
+    // Its router resolves a bare base path plus a query to the view route, so
+    // callers can append their query to this URL unchanged.
+    return QUrl("https://jacobjennings.github.io/cubiomes-finds-viewer/");
 }
 
 bool MainWindow::loadTranslation(QString lang)

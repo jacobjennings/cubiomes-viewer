@@ -1574,7 +1574,9 @@ void TabBiomes::openFindsInBrowser(bool favoritesOnly)
     QUrl url = parent->terrainViewerUrl();
     if (!url.isValid() || url.isEmpty())
     {
-        warn(parent, tr("The SteelMC terrain service is not installed or could not be started."));
+        // The viewer falls back to the published static build, so the only way
+        // to reach this is an unusable CUBIOMES_TERRAIN_VIEWER_URL override.
+        warn(parent, tr("The terrain viewer address is not a valid URL. Check CUBIOMES_TERRAIN_VIEWER_URL."));
         return;
     }
     QUrlQuery query;

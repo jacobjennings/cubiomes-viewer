@@ -58,6 +58,7 @@ public:
     int getDim();
     MapView *getMapView();
     QUrl terrainViewerUrl();
+    static QUrl publishedTerrainViewerUrl();
 
 protected:
     void saveSettings();
