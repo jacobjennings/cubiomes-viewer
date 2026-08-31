@@ -51,8 +51,13 @@ hand-off") for the user-facing contract.
   intentionally names the owner-approved CLI routes needed to reproduce the
   worker/judge workflow.
 - **Git identity.** Commit only as the repository owner's real identity. Never
-  commit as "Claude", "Gemini", or any agent persona. Do not commit or push
-  unless explicitly instructed.
+  commit as "Claude", "Gemini", or any agent persona.
+- **Always push when you commit.** A commit is not finished until it is pushed.
+  Every commit is followed immediately by a push to its tracking branch, whether
+  or not the owner said "push". A commit sitting unpushed is work nobody else
+  can see and a machine failure away from being lost. If a push fails, for
+  example because the remote moved or there is no network, say so in one line
+  and stop. Do not force, and do not rewrite history to make a push succeed.
 - **Worktree discipline.** Keep the worktree scope the orchestrator assigned.
   Preserve all user and pre-existing dirty changes; never `git checkout` or
   `git restore` another agent's or the owner's in-flight work, and never stage
